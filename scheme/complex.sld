@@ -18,16 +18,44 @@
   (inline
     real-part
     imag-part)
-  (import (scheme base))
+  (import (scheme base)
+          (scheme inexact))
   (begin
-    (define (real-part x) x)
-    (define (imag-part x) 0)
-    (define (angle z) 
-      (error "Complex numbers are not supported at this time"))
-    (define (magnitude z) 
-      (error "Complex numbers are not supported at this time"))
+    (define (real-part x) 
+      (if (complex? x)
+          (%real-part x)
+           x))
+
+    (define (imag-part x) 
+      (if (complex? x)
+          (%imag-part x)
+          0))
+
+    (define (magnitude z)
+      (sqrt (+ (* (real-part z) (real-part z))
+               (* (imag-part z) (imag-part z)))))
+
+    (define (angle z) (atan (imag-part z) (real-part z)))
+
+    (define (make-polar r phi)
+      (make-rectangular (* r (cos phi)) (* r (sin phi))))
+
     (define (make-rectangular x y)
-      (error "Complex numbers are not supported at this time"))
-    (define (make-polar x y)
-      (error "Complex numbers are not supported at this time"))
+      (%make-rect x y))
+
+    (define-c %real-part
+      "(void *data, int argc, closure _, object k, object z)"
+      " make_double(d, creal(complex_num_value(z)));
+        return_closcall1(data, k, &d); ")
+
+    (define-c %imag-part
+      "(void *data, int argc, closure _, object k, object z)"
+      " make_double(d, cimag(complex_num_value(z)));
+        return_closcall1(data, k, &d); ")
+
+    (define-c %make-rect
+      "(void *data, int argc, closure _, object k, object r, object i)"
+      " Cyc_check_num(data, r);
+        Cyc_check_num(data, i);
+        Cyc_make_rectangular(data, k, r, i); ")
 ))

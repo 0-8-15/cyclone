@@ -21,6 +21,9 @@
 //int JAE_DEBUG = 0;
 //int gcMoveCountsDEBUG[20] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
 
+static uint32_t Cyc_utf8_decode(uint32_t* state, uint32_t* codep, uint32_t byte);
+static int Cyc_utf8_count_code_points_and_bytes(uint8_t* s, char_type *codepoint, int *cpts, int *bytes);
+
 object Cyc_global_set(void *thd, object * glo, object value)
 {
   gc_mut_update((gc_thread_data *) thd, *glo, value);
@@ -53,14 +56,19 @@ const char *tag_names[] = {
       /*string_tag    */ , "string"
       /*symbol_tag    */ , "symbol"
       /*vector_tag    */ , "vector"
+      /*complex_num_tag*/ , "complex number"
   , "Reserved for future use"
 };
 
 void Cyc_invalid_type_error(void *data, int tag, object found)
 {
   char buf[256];
+#if GC_DEBUG_TRACE
+  // Object address can be very useful for GC debugging
+  snprintf(buf, 255, "Invalid type: expected %s, found (%p) ", tag_names[tag], found);
+#else
   snprintf(buf, 255, "Invalid type: expected %s, found ", tag_names[tag]);
-  //snprintf(buf, 255, "Invalid type: expected %s, found (%p) ", tag_names[tag], found);
+#endif
   Cyc_rt_raise2(data, buf, found);
 }
 
@@ -181,6 +189,7 @@ void pack_env_variables(void *data, object k)
     svar->str = alloca(sizeof(char) * (svar->len));
     strncpy(svar->str, e, svar->len);
     (svar->str)[svar->len] = '\0';
+    svar->num_cp = Cyc_utf8_count_code_points((uint8_t *)svar->str);
 
     if (eqpos) {
       eqpos++;
@@ -189,6 +198,7 @@ void pack_env_variables(void *data, object k)
     sval->hdr.grayed = 0;
     sval->tag = string_tag; 
     sval->len = strlen(eqpos);
+    svar->num_cp = Cyc_utf8_count_code_points((uint8_t *)eqpos);
     sval->str = eqpos;
     set_pair(tmp, svar, sval);
     set_pair(p, tmp, NULL);
@@ -304,17 +314,12 @@ static symbol_type Cyc_void_symbol = { {0}, symbol_tag, ""};
 const object quote_void = &Cyc_void_symbol;
 
 /* Stack Traces */
-void Cyc_st_add(void *data, char *frame)
-{
-  gc_thread_data *thd = (gc_thread_data *) data;
-  // Do not allow recursion to remove older frames
-  if (frame != thd->stack_prev_frame) {
-    thd->stack_prev_frame = frame;
-    thd->stack_traces[thd->stack_trace_idx] = frame;
-    thd->stack_trace_idx = (thd->stack_trace_idx + 1) % MAX_STACK_TRACES;
-  }
-}
 
+/**
+ * @brief Print the contents of the given thread's stack trace buffer.
+ * @param data Thread data object
+ * @param out Output stream
+ */
 void Cyc_st_print(void *data, FILE * out)
 {
   /* print to stream, note it is possible that
@@ -347,7 +352,7 @@ void Cyc_st_print(void *data, FILE * out)
 
  For now, GC of symbols is missing. long-term it probably would be desirable
 */
-char *_strdup(const char *s)
+static char *_strdup(const char *s)
 {
   char *d = malloc(strlen(s) + 1);
   if (d) {
@@ -356,7 +361,7 @@ char *_strdup(const char *s)
   return d;
 }
 
-object find_symbol_by_name(const char *name)
+static object find_symbol_by_name(const char *name)
 {
   symbol_type tmp = { {0}, symbol_tag, name};
   object result = set_get(&symbol_table, &tmp);
@@ -375,7 +380,7 @@ object add_symbol(symbol_type * psym)
   return psym;
 }
 
-object add_symbol_by_name(const char *name)
+static object add_symbol_by_name(const char *name)
 {
   symbol_type sym = { {0}, symbol_tag, _strdup(name)};
   symbol_type *psym = malloc(sizeof(symbol_type));
@@ -498,7 +503,13 @@ void clear_mutations(void *data)
 object Cyc_glo_call_cc = NULL;
 object Cyc_glo_eval_from_c = NULL;
 
-/* Exception handler */
+/**
+ * @brief The default exception handler
+ * @param data Thread data object
+ * @return argc Unused, just here to maintain calling convention
+ * @return _ Unused, just here to maintain calling convention
+ * @return err Object containing data for the error
+ */
 object Cyc_default_exception_handler(void *data, int argc, closure _,
                                      object err)
 {
@@ -534,6 +545,11 @@ object Cyc_default_exception_handler(void *data, int argc, closure _,
   return NULL;
 }
 
+/**
+ * @brief Return the current exception handler
+ * @param data Thread data object
+ * @return Object registered as the exception handler, or the default if none.
+ */
 object Cyc_current_exception_handler(void *data)
 {
   gc_thread_data *thd = (gc_thread_data *) data;
@@ -544,7 +560,11 @@ object Cyc_current_exception_handler(void *data)
   }
 }
 
-/* Raise an exception from the runtime code */
+/**
+ * @brief Raise an exception from the runtime code
+ * @param data Thread data object
+ * @param err Data for the error
+ */
 void Cyc_rt_raise(void *data, object err)
 {
   make_pair(c2, err, NULL);
@@ -556,9 +576,15 @@ void Cyc_rt_raise(void *data, object err)
   exit(1);
 }
 
+/**
+ * @brief Raise an exception from the runtime code
+ * @param data Thread data object
+ * @param msg A message describing the error
+ * @param err Data for the error
+ */
 void Cyc_rt_raise2(void *data, const char *msg, object err)
 {
-  make_string(s, msg);
+  make_utf8_string(data, s, msg);
   make_pair(c3, err, NULL);
   make_pair(c2, &s, &c3);
   make_pair(c1, boolean_f, &c2);
@@ -569,9 +595,14 @@ void Cyc_rt_raise2(void *data, const char *msg, object err)
   exit(1);
 }
 
+/**
+ * @brief Raise an exception from the runtime code
+ * @param data Thread data object
+ * @param err A message describing the error
+ */
 void Cyc_rt_raise_msg(void *data, const char *err)
 {
-  make_string(s, err);
+  make_utf8_string(data, s, err);
   Cyc_rt_raise(data, &s);
 }
 
@@ -643,27 +674,32 @@ int equal(object x, object y)
   //          type_of(y) == bignum_tag &&
   //          MP_EQ == mp_cmp(&bignum_value(x), &bignum_value(y)));
   }
-  case integer_tag:
-    return (obj_is_int(y) && obj_obj2int(y) == integer_value(x)) ||
-        (is_object_type(y) &&
-         type_of(y) == integer_tag &&
-         ((integer_type *) x)->value == ((integer_type *) y)->value);
+  //case integer_tag:
+  //  return (obj_is_int(y) && obj_obj2int(y) == integer_value(x)) ||
+  //      (is_object_type(y) &&
+  //       type_of(y) == integer_tag &&
+  //       ((integer_type *) x)->value == ((integer_type *) y)->value);
+  case complex_num_tag:
+    return (is_object_type(y) &&
+            type_of(y) == complex_num_tag &&
+            ((complex_num_type *) x)->value == ((complex_num_type *) y)->value);
+
   default:
     return x == y;
   }
 }
 
-object Cyc_car(void *data, object lis)
-{
-  Cyc_check_pair(data, lis);
-  return car(lis);
-}
-
-object Cyc_cdr(void *data, object lis)
-{
-  Cyc_check_pair(data, lis);
-  return cdr(lis);
-}
+//object Cyc_car(void *data, object lis)
+//{
+//  Cyc_check_pair(data, lis);
+//  return car(lis);
+//}
+//
+//object Cyc_cdr(void *data, object lis)
+//{
+//  Cyc_check_pair(data, lis);
+//  return cdr(lis);
+//}
 
 object Cyc_get_global_variables()
 {
@@ -711,7 +747,7 @@ object Cyc_has_cycle(object lst)
   slow_lst = lst;
   fast_lst = cdr(lst);
   while (1) {
-    if ((fast_lst == NULL))
+    if (fast_lst == NULL)
       return boolean_f;
     if (Cyc_is_pair(fast_lst) == boolean_f)
       return boolean_f;
@@ -721,6 +757,39 @@ object Cyc_has_cycle(object lst)
       return boolean_f;
     if (slow_lst == fast_lst)
       return boolean_t;
+
+    slow_lst = cdr(slow_lst);
+    fast_lst = cddr(fast_lst);
+  }
+}
+
+/**
+ * Predicate - is the object a proper list?
+ * Based on `Cyc_has_cycle` so it is safe to call on circular lists.
+ */
+object Cyc_is_list(object lst)
+{
+  object slow_lst, fast_lst;
+  if ((lst == NULL)){
+    return boolean_t;
+  } else if (is_value_type(lst)) {
+    return boolean_f;
+  } else if (is_object_type(lst) && type_of(lst) != pair_tag) {
+    return boolean_f;
+  }
+  slow_lst = lst;
+  fast_lst = cdr(lst);
+  while (1) {
+    if (fast_lst == NULL)
+      return boolean_t;
+    if (Cyc_is_pair(fast_lst) == boolean_f)
+      return boolean_f; // Improper list
+    if ((cdr(fast_lst)) == NULL)
+      return boolean_t;
+    if (Cyc_is_pair(cdr(fast_lst)) == boolean_f)
+      return boolean_f; // Improper
+    if (slow_lst == fast_lst)
+      return boolean_t; // Cycle; we have a list
 
     slow_lst = cdr(slow_lst);
     fast_lst = cddr(fast_lst);
@@ -802,7 +871,10 @@ object Cyc_display(void *data, object x, FILE * port)
     return quote_void;
   }
   if (obj_is_char(x)) {
-    fprintf(port, "%c", obj_obj2char(x));
+    char cbuf[5];
+    char_type unbox = obj_obj2char(x);
+    Cyc_utf8_encode_char(cbuf, 5, unbox);
+    fprintf(port, "%s", cbuf);
     return quote_void;
   }
   if (obj_is_int(x)) {
@@ -927,6 +999,23 @@ object Cyc_display(void *data, object x, FILE * port)
     fprintf(port, "%s", buf);
     break;
   }
+  case complex_num_tag: {
+    char rbuf[33], ibuf[33];
+    const char *plus="+", *empty="";
+    double dreal = creal(((complex_num_type *) x)->value);
+    double dimag = cimag(((complex_num_type *) x)->value);
+    double2buffer(rbuf, 32, dreal);
+    double2buffer(ibuf, 32, dimag);
+    if (dreal == 0.0) {
+      fprintf(port, "%si", ibuf);
+    } else {
+      fprintf(port, "%s%s%si", 
+        rbuf, 
+        (dimag < 0.0) ? empty : plus,
+        ibuf);
+    }
+    break;
+  }
   default:
     fprintf(port, "Cyc_display: bad tag x=%d\n", ((closure) x)->tag);
     exit(1);
@@ -982,7 +1071,7 @@ static object _Cyc_write(void *data, object x, FILE * port)
     return quote_void;
   }
   if (obj_is_char(x)) {
-    char c = obj_obj2char(x);
+    char_type c = obj_obj2char(x);
     switch (c) {
     case 0:   fprintf(port, "#\\null"); break;
     case 7:   fprintf(port, "#\\alarm"); break;
@@ -993,11 +1082,13 @@ static object _Cyc_write(void *data, object x, FILE * port)
     case 27:  fprintf(port, "#\\escape"); break;
     case 32:  fprintf(port, "#\\space"); break;
     case 127: fprintf(port, "#\\delete"); break;
-    default:
-      fprintf(port, "#\\%c", obj_obj2char(x));
+    default: {
+      char cbuf[5];
+      Cyc_utf8_encode_char(cbuf, 5, c);
+      fprintf(port, "#\\%s", cbuf);
       break;
+      }
     }
-    //fprintf(port, "#\\%c", obj_obj2char(x));
     return quote_void;
   }
   if (obj_is_int(x)) {
@@ -1095,7 +1186,25 @@ object Cyc_write_char(void *data, object c, object port)
   if (obj_is_char(c)) {
     FILE *fp = ((port_type *) port)->fp;
     if (fp){
-      fprintf(fp, "%c", obj_obj2char(c));
+      char cbuf[5];
+      char_type unbox = obj_obj2char(c);
+      Cyc_utf8_encode_char(cbuf, 5, unbox);
+      fprintf(fp, "%s", cbuf);
+    }
+  } else {
+    Cyc_rt_raise2(data, "Argument is not a character", c);
+  }
+  return quote_void;
+}
+
+object Cyc_write_u8(void *data, object c, object port)
+{
+  Cyc_check_port(data, port);
+  if (obj_is_char(c)) {
+    FILE *fp = ((port_type *) port)->fp;
+    if (fp){
+      char unbox = (char) obj_obj2char(c);
+      fprintf(fp, "%c", unbox);
     }
   } else {
     Cyc_rt_raise2(data, "Argument is not a character", c);
@@ -1106,8 +1215,8 @@ object Cyc_write_char(void *data, object c, object port)
 /* Fast versions of member and assoc */
 object memberp(void *data, object x, list l)
 {
-  Cyc_check_pair_or_null(data, l);
   for (; l != NULL; l = cdr(l)) {
+    Cyc_check_pair_or_null(data, l);
     if (boolean_f != equalp(x, car(l)))
       return l;
   }
@@ -1116,8 +1225,8 @@ object memberp(void *data, object x, list l)
 
 object memqp(void *data, object x, list l)
 {
-  Cyc_check_pair_or_null(data, l);
   for (; l != NULL; l = cdr(l)) {
+    Cyc_check_pair_or_null(data, l);
     if ((x == car(l)))
       return l;
   }
@@ -1129,6 +1238,7 @@ list assq(void *data, object x, list l)
   if ((l == NULL) || is_value_type(l) || type_of(l) != pair_tag)
     return boolean_f;
   for (; (l != NULL); l = cdr(l)) {
+    Cyc_check_pair(data, l);
     list la = car(l);
     Cyc_check_pair(data, la);
     if ((x == car(la)))
@@ -1142,6 +1252,7 @@ list assoc(void *data, object x, list l)
   if ((l == NULL) || is_value_type(l) || type_of(l) != pair_tag)
     return boolean_f;
   for (; (l != NULL); l = cdr(l)) {
+    Cyc_check_pair(data, l);
     list la = car(l);
     Cyc_check_pair(data, la);
     if (boolean_f != equalp(x, car(la)))
@@ -1149,7 +1260,92 @@ list assoc(void *data, object x, list l)
   }
   return boolean_f;
 }
+
+/**
+ * Same as assoc but check the cdr of each item for equality
+ */
+list assoc_cdr(void *data, object x, list l)
+{
+  if ((l == NULL) || is_value_type(l) || type_of(l) != pair_tag)
+    return boolean_f;
+  for (; (l != NULL); l = cdr(l)) {
+    list la = car(l);
+    Cyc_check_pair(data, la);
+    if (boolean_f != equalp(x, cdr(la)))
+      return la;
+  }
+  return boolean_f;
+}
 /* END member and assoc */
+
+object Cyc_fast_list_2(object ptr, object a1, object a2) 
+{
+  list_2_type *l = (list_2_type *)ptr;
+  set_pair( ((pair)(&(l->b))), a2, NULL);
+  set_pair( ((pair)(&(l->a))), a1, ((pair)(&(l->b))));
+  return ptr;
+}
+
+object Cyc_fast_list_3(object ptr, object a1, object a2, object a3) 
+{
+  list_3_type *l = (list_3_type *)ptr;
+  set_pair( ((pair)(&(l->c))), a3, NULL);
+  set_pair( ((pair)(&(l->b))), a2, ((pair)(&(l->c))));
+  set_pair( ((pair)(&(l->a))), a1, ((pair)(&(l->b))));
+  return ptr;
+}
+
+object Cyc_fast_list_4(object ptr, object a1, object a2, object a3, object a4) 
+{
+  list_4_type *l = (list_4_type *)ptr;
+  set_pair( ((pair)(&(l->d))), a4, NULL);
+  set_pair( ((pair)(&(l->c))), a3, ((pair)(&(l->d))));
+  set_pair( ((pair)(&(l->b))), a2, ((pair)(&(l->c))));
+  set_pair( ((pair)(&(l->a))), a1, ((pair)(&(l->b))));
+  return ptr;
+}
+
+object Cyc_fast_vector_2(object ptr, object a1, object a2) 
+{
+  vector_2_type *v = (vector_2_type *)ptr;
+  v->v.hdr.mark = gc_color_red; 
+  v->v.hdr.grayed = 0; 
+  v->v.tag = vector_tag; 
+  v->v.num_elements = 2; 
+  v->v.elements = v->arr;
+  v->v.elements[0] = a1;
+  v->v.elements[1] = a2;
+  return ptr;
+}
+
+object Cyc_fast_vector_3(object ptr, object a1, object a2, object a3) 
+{
+  vector_3_type *v = (vector_3_type *)ptr;
+  v->v.hdr.mark = gc_color_red; 
+  v->v.hdr.grayed = 0; 
+  v->v.tag = vector_tag; 
+  v->v.num_elements = 3; 
+  v->v.elements = v->arr;
+  v->v.elements[0] = a1;
+  v->v.elements[1] = a2;
+  v->v.elements[2] = a3;
+  return ptr;
+}
+
+object Cyc_fast_vector_4(object ptr, object a1, object a2, object a3, object a4) 
+{
+  vector_4_type *v = (vector_4_type *)ptr;
+  v->v.hdr.mark = gc_color_red; 
+  v->v.hdr.grayed = 0; 
+  v->v.tag = vector_tag; 
+  v->v.num_elements = 4; 
+  v->v.elements = v->arr;
+  v->v.elements[0] = a1;
+  v->v.elements[1] = a2;
+  v->v.elements[2] = a3;
+  v->v.elements[3] = a4;
+  return ptr;
+}
 
 // Internal function, do not use this anywhere outside the runtime
 object Cyc_heap_alloc_port(void *data, port_type *stack_p)
@@ -1254,28 +1450,17 @@ object Cyc_num_cmp_va_list(void *data, int argc,
  * Code is from: https://github.com/libtom/libtommath/issues/3
  */
 #define PRECISION 53
-double mp_get_double(mp_int *a)
+double mp_get_double(const mp_int *a)
 {
-    static const int NEED_DIGITS = (PRECISION + 2 * DIGIT_BIT - 2) / DIGIT_BIT;
-    static const double DIGIT_MULTI = (mp_digit)1 << DIGIT_BIT;
-
-    int i, limit;
-    double d = 0.0;
-
-    mp_clamp(a);
-    i = USED(a);
-    limit = i <= NEED_DIGITS ? 0 : i - NEED_DIGITS;
-
-    while (i-- > limit) {
-        d += DIGIT(a, i);
-        d *= DIGIT_MULTI;
-    }
-
-    if(SIGN(a) == MP_NEG)
-        d *= -1.0;
-
-    d *= pow(2.0, i * DIGIT_BIT);
-    return d;
+   int i;
+   double d = 0.0, fac = 1.0;
+   for (i = 0; i < DIGIT_BIT; ++i) {
+      fac *= 2.0;
+   }
+   for (i = a->used; i --> 0;) {
+      d = (d * fac) + (double)DIGIT(a, i);
+   }
+   return (a->sign == MP_NEG) ? -d : d;
 }
 
 // Convert a bignum back to fixnum if possible
@@ -1370,6 +1555,10 @@ int FUNC_OP(void *data, object x, object y) { \
       result = Cyc_bignum_cmp(BN_CMP, x, tx, y, ty); \
     } else if (tx == double_tag && ty == bignum_tag) { \
       result = (double_value(x)) OP mp_get_double(&bignum_value(y)); \
+    } else if (tx == complex_num_tag && ty == complex_num_tag) { \
+      result = (complex_num_value(x)) == (complex_num_value(y)); \
+    } else if (tx == complex_num_tag && ty != complex_num_tag) { \
+    } else if (tx != complex_num_tag && ty == complex_num_tag) { \
     } else { \
         make_string(s, "Bad argument type"); \
         make_pair(c1, y, NULL); \
@@ -1447,6 +1636,12 @@ object FUNC_FAST_OP(void *data, object x, object y) { \
       return Cyc_bignum_cmp(BN_CMP, x, tx, y, ty) ? boolean_t : boolean_f; \
     } else if (tx == double_tag && ty == bignum_tag) { \
       return (double_value(x)) OP mp_get_double(&bignum_value(x)) ? boolean_t : boolean_f; \
+    } else if (tx == complex_num_tag && ty == complex_num_tag) { \
+      return ((complex_num_value(x)) == (complex_num_value(y))) ? boolean_t : boolean_f; \
+    } else if (tx == complex_num_tag && ty != complex_num_tag) { \
+      return boolean_f; \
+    } else if (tx != complex_num_tag && ty == complex_num_tag) { \
+      return boolean_f; \
     } else { \
         goto bad_arg_type_error; \
     } \
@@ -1468,122 +1663,139 @@ declare_num_cmp(Cyc_num_lt,  Cyc_num_lt_op,  Cyc_num_fast_lt_op, dispatch_num_lt
 declare_num_cmp(Cyc_num_gte, Cyc_num_gte_op, Cyc_num_fast_gte_op, dispatch_num_gte, >=, CYC_BN_GTE);
 declare_num_cmp(Cyc_num_lte, Cyc_num_lte_op, Cyc_num_fast_lte_op, dispatch_num_lte, <=, CYC_BN_LTE);
 
-object Cyc_is_boolean(object o)
-{
-  if ((o != NULL) &&
-      !is_value_type(o) &&
-      ((list) o)->tag == boolean_tag && ((boolean_f == o) || (boolean_t == o)))
-    return boolean_t;
-  return boolean_f;
-}
-
+//object Cyc_is_boolean(object o)
+//{
+//  if ((o != NULL) &&
+//      !is_value_type(o) &&
+//      ((list) o)->tag == boolean_tag && ((boolean_f == o) || (boolean_t == o)))
+//    return boolean_t;
+//  return boolean_f;
+//}
+//
 //object Cyc_is_pair(object o)
 //{
 //  if (is_object_type(o) && ((list) o)->tag == pair_tag)
 //    return boolean_t;
 //  return boolean_f;
 //}
-
-object Cyc_is_null(object o)
-{
-  if (o == NULL)
-    return boolean_t;
-  return boolean_f;
-}
+//
+//object Cyc_is_null(object o)
+//{
+//  if (o == NULL)
+//    return boolean_t;
+//  return boolean_f;
+//}
 
 object Cyc_is_number(object o)
 {
   if ((o != NULL) && (obj_is_int(o) || (!is_value_type(o)
                                         && (type_of(o) == integer_tag
                                             || type_of(o) == bignum_tag
-                                            || type_of(o) == double_tag))))
+                                            || type_of(o) == double_tag
+                                            || type_of(o) == complex_num_tag))))
     return boolean_t;
   return boolean_f;
 }
 
 object Cyc_is_real(object o)
 {
-  return Cyc_is_number(o);
-}
-
-object Cyc_is_fixnum(object o)
-{
-  if (obj_is_int(o))
+  if ((o != NULL) && (obj_is_int(o) || 
+      (!is_value_type(o) && (type_of(o) == integer_tag
+                          || type_of(o) == bignum_tag
+                          || type_of(o) == double_tag
+                          || (type_of(o) == complex_num_tag &&
+                              cimag(complex_num_value(o)) == 0.0))))) // Per R7RS
     return boolean_t;
   return boolean_f;
 }
+
+object Cyc_is_complex(object o)
+{
+  if ((o != NULL) && !is_value_type(o) && ((list) o)->tag == complex_num_tag)
+    return boolean_t;
+  return boolean_f;
+}
+
+//object Cyc_is_fixnum(object o)
+//{
+//  if (obj_is_int(o))
+//    return boolean_t;
+//  return boolean_f;
+//}
 
 object Cyc_is_integer(object o)
 {
   if ((o != NULL) && (obj_is_int(o) ||
-                      (!is_value_type(o) && type_of(o) == integer_tag) ||
-                      (!is_value_type(o) && type_of(o) == bignum_tag)))
+      (!is_value_type(o) && type_of(o) == integer_tag) ||
+      (!is_value_type(o) && type_of(o) == bignum_tag)
+      // || (!is_value_type(o) && type_of(o) == double_tag && double_value(o) == round(double_value(o)))
+      )) // Per R7RS
     return boolean_t;
   return boolean_f;
 }
 
-object Cyc_is_bignum(object o)
-{
-  if ((o != NULL) && !is_value_type(o) && ((list) o)->tag == bignum_tag)
-    return boolean_t;
-  return boolean_f;
-}
-
-object Cyc_is_symbol(object o)
-{
-  if ((o != NULL) && !is_value_type(o) && ((list) o)->tag == symbol_tag)
-    return boolean_t;
-  return boolean_f;
-}
-
-object Cyc_is_vector(object o)
-{
-  if ((o != NULL) && !is_value_type(o) && ((list) o)->tag == vector_tag)
-    return boolean_t;
-  return boolean_f;
-}
-
-object Cyc_is_bytevector(object o)
-{
-  if ((o != NULL) && !is_value_type(o) && ((list) o)->tag == bytevector_tag)
-    return boolean_t;
-  return boolean_f;
-}
-
-object Cyc_is_port(object o)
-{
-  if ((o != NULL) && !is_value_type(o) && ((list) o)->tag == port_tag)
-    return boolean_t;
-  return boolean_f;
-}
-
-object Cyc_is_mutex(object o)
-{
-  if ((o != NULL) && !is_value_type(o) && ((list) o)->tag == mutex_tag)
-    return boolean_t;
-  return boolean_f;
-}
-
-object Cyc_is_cond_var(object o)
-{
-  if ((o != NULL) && !is_value_type(o) && ((list) o)->tag == cond_var_tag)
-    return boolean_t;
-  return boolean_f;
-}
-
-object Cyc_is_string(object o)
-{
-  if ((o != NULL) && !is_value_type(o) && ((list) o)->tag == string_tag)
-    return boolean_t;
-  return boolean_f;
-}
-
-object Cyc_is_char(object o)
-{
-  if (obj_is_char(o))
-    return boolean_t;
-  return boolean_f;
-}
+//object Cyc_is_bignum(object o)
+//{
+//  if ((o != NULL) && !is_value_type(o) && ((list) o)->tag == bignum_tag)
+//    return boolean_t;
+//  return boolean_f;
+//}
+//
+//object Cyc_is_symbol(object o)
+//{
+//  if ((o != NULL) && !is_value_type(o) && ((list) o)->tag == symbol_tag)
+//    return boolean_t;
+//  return boolean_f;
+//}
+//
+//object Cyc_is_vector(object o)
+//{
+//  if ((o != NULL) && !is_value_type(o) && ((list) o)->tag == vector_tag)
+//    return boolean_t;
+//  return boolean_f;
+//}
+//
+//object Cyc_is_bytevector(object o)
+//{
+//  if ((o != NULL) && !is_value_type(o) && ((list) o)->tag == bytevector_tag)
+//    return boolean_t;
+//  return boolean_f;
+//}
+//
+//object Cyc_is_port(object o)
+//{
+//  if ((o != NULL) && !is_value_type(o) && ((list) o)->tag == port_tag)
+//    return boolean_t;
+//  return boolean_f;
+//}
+//
+//object Cyc_is_mutex(object o)
+//{
+//  if ((o != NULL) && !is_value_type(o) && ((list) o)->tag == mutex_tag)
+//    return boolean_t;
+//  return boolean_f;
+//}
+//
+//object Cyc_is_cond_var(object o)
+//{
+//  if ((o != NULL) && !is_value_type(o) && ((list) o)->tag == cond_var_tag)
+//    return boolean_t;
+//  return boolean_f;
+//}
+//
+//object Cyc_is_string(object o)
+//{
+//  if ((o != NULL) && !is_value_type(o) && ((list) o)->tag == string_tag)
+//    return boolean_t;
+//  return boolean_f;
+//}
+//
+//object Cyc_is_char(object o)
+//{
+//  if (obj_is_char(o))
+//    return boolean_t;
+//  return boolean_f;
+//}
 
 object Cyc_is_procedure(void *data, object o)
 {
@@ -1606,45 +1818,45 @@ object Cyc_is_procedure(void *data, object o)
   return boolean_f;
 }
 
-object Cyc_is_macro(object o)
-{
-  int tag;
-  if ((o != NULL) && !is_value_type(o)) {
-    tag = type_of(o);
-    if (tag == macro_tag) {
-      return boolean_t;
-    }
-  }
-  return boolean_f;
-}
-
-object Cyc_is_eof_object(object o)
-{
-  if ((o != NULL) && !is_value_type(o) && type_of(o) == eof_tag)
-    return boolean_t;
-  return boolean_f;
-}
-
-object Cyc_is_cvar(object o)
-{
-  if ((o != NULL) && !is_value_type(o) && type_of(o) == cvar_tag)
-    return boolean_t;
-  return boolean_f;
-}
-
-object Cyc_is_opaque(object o)
-{
-  if ((o != NULL) && !is_value_type(o) && ((list) o)->tag == c_opaque_tag)
-    return boolean_t;
-  return boolean_f;
-}
-
-object Cyc_eq(object x, object y)
-{
-  if (x == y)
-    return boolean_t;
-  return boolean_f;
-}
+//object Cyc_is_macro(object o)
+//{
+//  int tag;
+//  if ((o != NULL) && !is_value_type(o)) {
+//    tag = type_of(o);
+//    if (tag == macro_tag) {
+//      return boolean_t;
+//    }
+//  }
+//  return boolean_f;
+//}
+//
+//object Cyc_is_eof_object(object o)
+//{
+//  if ((o != NULL) && !is_value_type(o) && type_of(o) == eof_tag)
+//    return boolean_t;
+//  return boolean_f;
+//}
+//
+//object Cyc_is_cvar(object o)
+//{
+//  if ((o != NULL) && !is_value_type(o) && type_of(o) == cvar_tag)
+//    return boolean_t;
+//  return boolean_f;
+//}
+//
+//object Cyc_is_opaque(object o)
+//{
+//  if ((o != NULL) && !is_value_type(o) && ((list) o)->tag == c_opaque_tag)
+//    return boolean_t;
+//  return boolean_f;
+//}
+//
+//object Cyc_eq(object x, object y)
+//{
+//  if (x == y)
+//    return boolean_t;
+//  return boolean_f;
+//}
 
 object Cyc_set_cell(void *data, object l, object val)
 {
@@ -1679,7 +1891,7 @@ object Cyc_vector_set(void *data, object v, object k, object obj)
 {
   int idx;
   Cyc_check_vec(data, v);
-  Cyc_check_num(data, k);
+  Cyc_check_fixnum(data, k);
   idx = unbox_number(k);
 
   if (idx < 0 || idx >= ((vector) v)->num_elements) {
@@ -1697,7 +1909,7 @@ object Cyc_vector_ref(void *data, object v, object k)
 {
   int idx;
   Cyc_check_vec(data, v);
-  Cyc_check_num(data, k);
+  Cyc_check_fixnum(data, k);
 
   idx = unbox_number(k);
   if (idx < 0 || idx >= ((vector) v)->num_elements) {
@@ -1802,6 +2014,21 @@ object Cyc_number2string2(void *data, object cont, int argc, object n, ...)
         snprintf(buffer, 1024, "%d", ((integer_type *) n)->value);
       } else if (type_of(n) == double_tag) {
         double2buffer(buffer, 1024, ((double_type *) n)->value);
+      } else if (type_of(n) == complex_num_tag) {
+        char rbuf[33], ibuf[33];
+        const char *plus="+", *empty="";
+        double dreal = creal(((complex_num_type *) n)->value);
+        double dimag = cimag(((complex_num_type *) n)->value);
+        double2buffer(rbuf, 32, dreal);
+        double2buffer(ibuf, 32, dimag);
+        if (dreal == 0.0) {
+          snprintf(buffer, 1024, "%si", ibuf);
+        } else {
+          snprintf(buffer, 1024, "%s%s%si", 
+            rbuf, 
+            (dimag < 0.0) ? empty : plus,
+            ibuf);
+        }
       } else {
         Cyc_rt_raise2(data, "number->string - Unexpected object", n);
       }
@@ -1816,7 +2043,7 @@ object Cyc_symbol2string(void *data, object cont, object sym)
   Cyc_check_sym(data, sym);
   {
     const char *desc = symbol_desc(sym);
-    make_string(str, desc);
+    make_utf8_string(data, str, desc);
     _return_closcall1(data, cont, &str);
 }}
 
@@ -1833,25 +2060,51 @@ object Cyc_string2symbol(void *data, object str)
 
 object Cyc_list2string(void *data, object cont, object lst)
 {
-  char *buf;
-  int i = 0;
-  object len;
+  char *buf, cbuf[5];
+  int i = 0, len = 0, num_cp = 0;
+  object cbox, tmp = lst;
+  char_type ch;
 
   Cyc_check_pair_or_null(data, lst);
-  len = Cyc_length(data, lst);  // Inefficient, walks whole list
+
+  // Need to walk the list of chars to compute multibyte length
+  while (tmp) {
+    if (is_value_type(tmp) || ((list) tmp)->tag != pair_tag) {
+      Cyc_rt_raise2(data, "length - invalid parameter, expected list", tmp);
+    }
+    cbox = car(tmp);
+    ch = obj_obj2char(cbox);
+    if (!obj_is_char(cbox)) {
+      Cyc_rt_raise2(data, "Expected character but received", cbox);
+    }
+    if (!ch) {
+      len++;
+      num_cp++; // Failsafe?
+    } else {
+      Cyc_utf8_encode_char(cbuf, 5, ch);
+      len += strlen(cbuf);
+      num_cp++;
+    }
+    tmp = cdr(tmp);
+  }
 
   {
-    make_string_noalloc(str, NULL, (obj_obj2int(len)));
-    str.str = buf = alloca(sizeof(char) * (obj_obj2int(len) + 1));
+    object str;
+    alloc_string(data, str, len, num_cp);
+    buf = ((string_type *)str)->str;
     while ((lst != NULL)) {
-      if (!obj_is_char(car(lst))) {
-        Cyc_rt_raise2(data, "Expected character but received", car(lst));
+      cbox = car(lst);
+      ch = obj_obj2char(cbox); // Already validated, can assume chars now
+      if (!ch) {
+        i++;
+      } else {
+        Cyc_utf8_encode_char(&(buf[i]), 5, ch);
+        i += strlen(buf+i);
       }
-      buf[i++] = obj_obj2char(car(lst));
       lst = cdr(lst);
     }
     buf[i] = '\0';
-    _return_closcall1(data, cont, &str);
+    _return_closcall1(data, cont, str);
   }
 }
 
@@ -1938,7 +2191,7 @@ Convert string s to int out.
 
 @return Indicates if the operation succeeded, or why it failed.
 */
-str2int_errno str2int(int *out, char *s, int base) 
+static str2int_errno str2int(int *out, char *s, int base) 
 {
     char *end;
     if (s[0] == '\0' || isspace((unsigned char) s[0]))
@@ -2032,7 +2285,7 @@ object Cyc_string_cmp(void *data, object str1, object str2)
 }
 
 #define Cyc_string_append_va_list(data, argc) { \
-    int i = 0, total_len = 1; \
+    int i = 0, total_cp = 0, total_len = 1; \
     int *len = alloca(sizeof(int) * argc); \
     char *buffer, *bufferp, **str = alloca(sizeof(char *) * argc); \
     object tmp; \
@@ -2041,6 +2294,7 @@ object Cyc_string_cmp(void *data, object str1, object str2)
       str[i] = ((string_type *)str1)->str; \
       len[i] = string_len((str1)); \
       total_len += len[i]; \
+      total_cp += string_num_cp((str1)); \
     } \
     for (i = 1; i < argc; i++) { \
       tmp = va_arg(ap, object); \
@@ -2048,6 +2302,7 @@ object Cyc_string_cmp(void *data, object str1, object str2)
       str[i] = ((string_type *)tmp)->str; \
       len[i] = string_len((tmp)); \
       total_len += len[i]; \
+      total_cp += string_num_cp((tmp)); \
     } \
     buffer = bufferp = alloca(sizeof(char) * total_len); \
     for (i = 0; i < argc; i++) { \
@@ -2056,6 +2311,7 @@ object Cyc_string_cmp(void *data, object str1, object str2)
     } \
     *bufferp = '\0'; \
     make_string(result, buffer); \
+    string_num_cp((&result)) = total_cp; \
     va_end(ap); \
     _return_closcall1(data, cont, &result); \
 }
@@ -2078,19 +2334,35 @@ object Cyc_string_append(void *data, object cont, int _argc, object str1, ...)
 object Cyc_string_length(void *data, object str)
 {
   Cyc_check_str(data, str);
+  return obj_int2obj(string_num_cp(str));
+}
+
+object Cyc_string_byte_length(void *data, object str)
+{
+  Cyc_check_str(data, str);
   return obj_int2obj(string_len(str));
 }
 
 object Cyc_string_set(void *data, object str, object k, object chr)
 {
+  char buf[5];
   char *raw;
-  int idx, len;
+  int idx, len, buf_len;
+  char_type input_char;
 
   Cyc_check_str(data, str);
-  Cyc_check_num(data, k);
+  Cyc_check_fixnum(data, k);
 
   if (boolean_t != Cyc_is_char(chr)) {
     Cyc_rt_raise2(data, "Expected char but received", chr);
+  }
+
+  input_char = obj_obj2char(chr);
+  if (!input_char) {
+    buf_len = 1;
+  } else {
+    Cyc_utf8_encode_char(buf, 5, input_char);
+    buf_len = strlen(buf);
   }
 
   raw = string_str(str);
@@ -2098,7 +2370,69 @@ object Cyc_string_set(void *data, object str, object k, object chr)
   len = string_len(str);
 
   Cyc_check_bounds(data, "string-set!", len, idx);
-  raw[idx] = obj_obj2char(chr);
+
+  if (string_num_cp(str) == string_len(str) && buf_len == 1) {
+    // Take fast path if all chars are just 1 byte
+    raw[idx] = obj_obj2char(chr);
+  } else {
+    // Slower path for UTF-8, need to handle replacement differently 
+    // depending upon how the new char affects length of the string
+    char *tmp = raw, *this_cp = raw;
+    char_type codepoint;
+    uint32_t state = 0;
+    int i = 0, count, prev_cp_bytes = 0, cp_idx;
+
+    // Find index to change, and how many bytes it is
+    for (count = 0; *tmp; ++tmp){
+      prev_cp_bytes++;
+      if (!Cyc_utf8_decode(&state, &codepoint, (uint8_t)*tmp)){
+        if (count == idx) {
+          break;
+        }
+        this_cp = tmp + 1;
+        count += 1;
+        prev_cp_bytes = 0;
+      }
+      i++;
+    }
+    cp_idx = i;
+    if (state != CYC_UTF8_ACCEPT) {
+       Cyc_rt_raise2(data, "string-set! - invalid character at index", k);
+    }
+
+    // Perform actual mutation
+    //
+    // Now we know length of start (both in codepoints and bytes),
+    // and we know the codepoint to be replaced. by calculating its length
+    // we can compute where the end portion starts, and by using str we can
+    // figure out how many remaining bytes/codepoints are in end
+    //
+    // 3 cases: 
+    // - 1) buf_len = prev_cp_bytes, just straight replace
+    if (buf_len == prev_cp_bytes) {
+      for (i = 0; i < buf_len; i++) {
+        this_cp[i] = buf[i];
+      }
+    }
+    // - 2) buf_len < prev_cp_bytes, replace and shift chars down
+    else if (buf_len < prev_cp_bytes) {
+      // Replace code point with shorter one
+      for (i = 0; i < buf_len; i++) {
+        this_cp[i] = buf[i];
+      }
+      // Move string down to eliminate unneeded chars
+      memmove(this_cp + buf_len, this_cp + prev_cp_bytes, len - cp_idx);
+      // Null terminate the shorter string.
+      // Ensure string_len is not reduced because original 
+      // value still matters for GC purposes
+      raw[len - (prev_cp_bytes - buf_len)] = '\0'; 
+    }
+    // - 3) TODO: buf_len > prev_cp_bytes, will need to allocate more memory (!!)
+    else {
+      // TODO: maybe we can try a little harder here, at least in some cases
+      Cyc_rt_raise2(data, "string-set! - Unable to allocate memory to store multibyte character", chr);
+    }
+  }
   return str;
 }
 
@@ -2108,17 +2442,34 @@ object Cyc_string_ref(void *data, object str, object k)
   int idx, len;
 
   Cyc_check_str(data, str);
-  Cyc_check_num(data, k);
+  Cyc_check_fixnum(data, k);
 
   raw = string_str(str);
   idx = unbox_number(k);
-  len = string_len(str);
+  len = string_num_cp(str);
 
   if (idx < 0 || idx >= len) {
     Cyc_rt_raise2(data, "string-ref - invalid index", k);
   }
 
-  return obj_char2obj(raw[idx]);
+  // Take fast path if all chars are just 1 byte
+  if (string_num_cp(str) == string_len(str)) {
+    return obj_char2obj(raw[idx]);
+  } else {
+    char_type codepoint = 0;
+    uint32_t state = 0;
+    int count;
+
+    for (count = 0; *raw; ++raw){
+      if (!Cyc_utf8_decode(&state, &codepoint, (uint8_t)*raw)){
+        if (count == idx) break; // Reached requested index
+        count += 1;
+      }
+    }
+    if (state != CYC_UTF8_ACCEPT)
+       Cyc_rt_raise2(data, "string-ref - invalid character at index", k);
+    return obj_char2obj(codepoint);
+  }
 }
 
 object Cyc_substring(void *data, object cont, object str, object start,
@@ -2128,13 +2479,13 @@ object Cyc_substring(void *data, object cont, object str, object start,
   int s, e, len;
 
   Cyc_check_str(data, str);
-  Cyc_check_num(data, start);
-  Cyc_check_num(data, end);
+  Cyc_check_fixnum(data, start);
+  Cyc_check_fixnum(data, end);
 
   raw = string_str(str);
   s = unbox_number(start);
   e = unbox_number(end);
-  len = string_len(str);
+  len = string_num_cp(str);
 
   if (s > e) {
     Cyc_rt_raise2(data, "substring - start cannot be greater than end", start);
@@ -2148,8 +2499,32 @@ object Cyc_substring(void *data, object cont, object str, object start,
     e = len;
   }
 
-  {
+  if (string_num_cp(str) == string_len(str)){ // Fast path for ASCII
     make_string_with_len(sub, raw + s, e - s);
+    _return_closcall1(data, cont, &sub);
+  } else {
+    const char *tmp = raw;
+    char_type codepoint;
+    uint32_t state = 0;
+    int num_ch, cur_ch_bytes = 0, start_i = 0, end_i = 0;
+    for (num_ch = 0; *tmp; ++tmp){
+      cur_ch_bytes++;
+      if (!Cyc_utf8_decode(&state, &codepoint, (uint8_t)*tmp)){
+        end_i += cur_ch_bytes;
+        num_ch += 1;
+        cur_ch_bytes = 0;
+
+        if (num_ch == s) {
+          start_i = end_i;
+        }
+        if (num_ch == e) {
+          break;
+        }
+      }
+    }
+    if (state != CYC_UTF8_ACCEPT)
+       Cyc_rt_raise2(data, "substring - invalid character in string", str);
+    make_utf8_string_with_len(sub, raw + start_i, end_i - start_i, e - s);
     _return_closcall1(data, cont, &sub);
   }
 }
@@ -2164,22 +2539,28 @@ object Cyc_installation_dir(void *data, object cont, object type)
       strncmp(((symbol) type)->desc, "sld", 5) == 0) {
     char buf[1024];
     snprintf(buf, sizeof(buf), "%s", CYC_INSTALL_SLD);
-    make_string(str, buf);
+    make_utf8_string(data, str, buf);
     _return_closcall1(data, cont, &str);
   } else if (Cyc_is_symbol(type) == boolean_t &&
              strncmp(((symbol) type)->desc, "lib", 5) == 0) {
     char buf[1024];
     snprintf(buf, sizeof(buf), "%s", CYC_INSTALL_LIB);
-    make_string(str, buf);
+    make_utf8_string(data, str, buf);
+    _return_closcall1(data, cont, &str);
+  } else if (Cyc_is_symbol(type) == boolean_t &&
+             strncmp(((symbol) type)->desc, "bin", 5) == 0) {
+    char buf[1024];
+    snprintf(buf, sizeof(buf), "%s", CYC_INSTALL_BIN);
+    make_utf8_string(data, str, buf);
     _return_closcall1(data, cont, &str);
   } else if (Cyc_is_symbol(type) == boolean_t &&
              strncmp(((symbol) type)->desc, "inc", 5) == 0) {
     char buf[1024];
     snprintf(buf, sizeof(buf), "%s", CYC_INSTALL_INC);
-    make_string(str, buf);
+    make_utf8_string(data, str, buf);
     _return_closcall1(data, cont, &str);
   } else {
-    make_string(str, CYC_INSTALL_DIR);
+    make_utf8_string(data, str, CYC_INSTALL_DIR);
     _return_closcall1(data, cont, &str);
   }
 }
@@ -2193,22 +2574,22 @@ object Cyc_compilation_environment(void *data, object cont, object var)
     if (strncmp(((symbol) var)->desc, "cc-prog", 8) == 0) {
       char buf[1024];
       snprintf(buf, sizeof(buf), "%s", CYC_CC_PROG);
-      make_string(str, buf);
+      make_utf8_string(data, str, buf);
       _return_closcall1(data, cont, &str);
     } else if (strncmp(((symbol) var)->desc, "cc-exec", 8) == 0) {
       char buf[1024];
       snprintf(buf, sizeof(buf), "%s", CYC_CC_EXEC);
-      make_string(str, buf);
+      make_utf8_string(data, str, buf);
       _return_closcall1(data, cont, &str);
     } else if (strncmp(((symbol) var)->desc, "cc-lib", 7) == 0) {
       char buf[1024];
       snprintf(buf, sizeof(buf), "%s", CYC_CC_LIB);
-      make_string(str, buf);
+      make_utf8_string(data, str, buf);
       _return_closcall1(data, cont, &str);
     } else if (strncmp(((symbol) var)->desc, "cc-so", 6) == 0) {
       char buf[1024];
       snprintf(buf, sizeof(buf), "%s", CYC_CC_SO);
-      make_string(str, buf);
+      make_utf8_string(data, str, buf);
       _return_closcall1(data, cont, &str);
     }
   }
@@ -2234,7 +2615,7 @@ object Cyc_command_line_arguments(void *data, object cont)
   for (i = _cyc_argc; i > 1; i--) {     // skip program name
     object ps = alloca(sizeof(string_type));
     object pl = alloca(sizeof(pair_type));
-    make_string(s, _cyc_argv[i - 1]);
+    make_utf8_string(data, s, _cyc_argv[i - 1]);
     memcpy(ps, &s, sizeof(string_type));
     ((list) pl)->hdr.mark = gc_color_red;
     ((list) pl)->hdr.grayed = 0;
@@ -2437,7 +2818,6 @@ object Cyc_bytevector_copy(void *data, object cont, object bv, object start,
 {
   int s, e;
   int len;
-  make_empty_bytevector(result);
 
   Cyc_check_bvec(data, bv);
   Cyc_check_num(data, start);
@@ -2455,10 +2835,27 @@ object Cyc_bytevector_copy(void *data, object cont, object bv, object start,
     Cyc_rt_raise2(data, "bytevector-copy - invalid end", end);
   }
 
-  result.len = len;
-  result.data = alloca(sizeof(char) * len);
-  memcpy(&result.data[0], &(((bytevector) bv)->data)[s], len);
-  _return_closcall1(data, cont, &result);
+  if (len >= MAX_STACK_OBJ) {
+    int heap_grown;
+    object result = gc_alloc(((gc_thread_data *)data)->heap,
+                  sizeof(bytevector_type) + len,
+                  boolean_f, // OK to populate manually over here
+                  (gc_thread_data *)data, 
+                  &heap_grown);
+    ((bytevector) result)->hdr.mark = ((gc_thread_data *)data)->gc_alloc_color;
+    ((bytevector) result)->hdr.grayed = 0;
+    ((bytevector) result)->tag = bytevector_tag;
+    ((bytevector) result)->len = len;
+    ((bytevector) result)->data = (char *)(((char *)result) + sizeof(bytevector_type));
+    memcpy(&(((bytevector) result)->data[0]), &(((bytevector) bv)->data)[s], len);
+    _return_closcall1(data, cont, result);
+  } else {
+    make_empty_bytevector(result);
+    result.len = len;
+    result.data = alloca(sizeof(char) * len);
+    memcpy(&result.data[0], &(((bytevector) bv)->data)[s], len);
+    _return_closcall1(data, cont, &result);
+  }
 }
 
 object Cyc_utf82string(void *data, object cont, object bv, object start,
@@ -2486,11 +2883,12 @@ object Cyc_utf82string(void *data, object cont, object bv, object start,
   }
 
   {
-    make_string_noalloc(st, NULL, len);
-    st.str = alloca(sizeof(char) * (len + 1));
-    memcpy(st.str, &buf[s], len);
-    st.str[len] = '\0';
-    _return_closcall1(data, cont, &st);
+    object st;
+    alloc_string(data, st, len, len);
+    memcpy(((string_type *)st)->str, &buf[s], len);
+    ((string_type *)st)->str[len] = '\0';
+    ((string_type *)st)->num_cp = Cyc_utf8_count_code_points((uint8_t *)(((string_type *)st)->str));
+    _return_closcall1(data, cont, st);
   }
 }
 
@@ -2499,28 +2897,90 @@ object Cyc_string2utf8(void *data, object cont, object str, object start,
 {
   int s, e;
   int len;
-  make_empty_bytevector(result);
 
   Cyc_check_str(data, str);
-  Cyc_check_num(data, start);
-  Cyc_check_num(data, end);
+  Cyc_check_fixnum(data, start);
+  Cyc_check_fixnum(data, end);
 
   s = unbox_number(start);
   e = unbox_number(end);
   len = e - s;
 
-  if (s < 0 || (s >= string_len(str) && len > 0)) {
+  if (s < 0 || (s >= string_num_cp(str) && len > 0)) {
     Cyc_rt_raise2(data, "string->utf8 - invalid start", start);
   }
 
-  if (e < 0 || e < s || e > string_len(str)) {
+  if (e < 0 || e < s || e > string_num_cp(str)) {
     Cyc_rt_raise2(data, "string->utf8 - invalid end", end);
   }
 
-  result.len = len;
-  result.data = alloca(sizeof(char) * len);
-  memcpy(&result.data[0], &(string_str(str))[s], len);
-  _return_closcall1(data, cont, &result);
+  // Fast path
+  if (string_num_cp(str) == string_len(str)) {
+    if (len >= MAX_STACK_OBJ) {
+      int heap_grown;
+      object bv = gc_alloc(((gc_thread_data *)data)->heap,
+                    sizeof(bytevector_type) + len,
+                    boolean_f, // OK to populate manually over here
+                    (gc_thread_data *)data, 
+                    &heap_grown);
+      ((bytevector) bv)->hdr.mark = ((gc_thread_data *)data)->gc_alloc_color;
+      ((bytevector) bv)->hdr.grayed = 0;
+      ((bytevector) bv)->tag = bytevector_tag;
+      ((bytevector) bv)->len = len;
+      ((bytevector) bv)->data = (char *)(((char *)bv) + sizeof(bytevector_type));
+      memcpy(&(((bytevector) bv)->data[0]), &(string_str(str))[s], len);
+      _return_closcall1(data, cont, bv);
+    } else {
+      make_empty_bytevector(result);
+      result.len = len;
+      result.data = alloca(sizeof(char) * len);
+      memcpy(&result.data[0], &(string_str(str))[s], len);
+      _return_closcall1(data, cont, &result);
+    }
+  } else {
+    const char *tmp = string_str(str);
+    char_type codepoint;
+    uint32_t state = 0;
+    int num_ch, cur_ch_bytes = 0, start_i = 0, end_i = 0;
+    // Figure out start / end indices
+    for (num_ch = 0; *tmp; ++tmp){
+      cur_ch_bytes++;
+      if (!Cyc_utf8_decode(&state, &codepoint, (uint8_t)*tmp)){
+        end_i += cur_ch_bytes;
+        num_ch += 1;
+        cur_ch_bytes = 0;
+
+        if (num_ch == s) {
+          start_i = end_i;
+        }
+        if (num_ch == e) {
+          break;
+        }
+      }
+    }
+    len = end_i - start_i;
+    if (len >= MAX_STACK_OBJ) {
+      int heap_grown;
+      object bv = gc_alloc(((gc_thread_data *)data)->heap,
+                    sizeof(bytevector_type) + len,
+                    boolean_f, // OK to populate manually over here
+                    (gc_thread_data *)data, 
+                    &heap_grown);
+      ((bytevector) bv)->hdr.mark = ((gc_thread_data *)data)->gc_alloc_color;
+      ((bytevector) bv)->hdr.grayed = 0;
+      ((bytevector) bv)->tag = bytevector_tag;
+      ((bytevector) bv)->len = len;
+      ((bytevector) bv)->data = (char *)(((char *)bv) + sizeof(bytevector_type));
+      memcpy(&(((bytevector) bv)->data[0]), &(string_str(str))[start_i], len);
+      _return_closcall1(data, cont, bv);
+    } else {
+      make_empty_bytevector(result);
+      result.len = len;
+      result.data = alloca(sizeof(char) * result.len);
+      memcpy(&result.data[0], &(string_str(str))[start_i], result.len);
+      _return_closcall1(data, cont, &result);
+    }
+  }
 }
 
 object Cyc_bytevector_u8_ref(void *data, object bv, object k)
@@ -2530,7 +2990,7 @@ object Cyc_bytevector_u8_ref(void *data, object bv, object k)
   int val;
 
   Cyc_check_bvec(data, bv);
-  Cyc_check_num(data, k);
+  Cyc_check_fixnum(data, k);
 
   buf = ((bytevector) bv)->data;
   idx = unbox_number(k);
@@ -2549,8 +3009,8 @@ object Cyc_bytevector_u8_set(void *data, object bv, object k, object b)
   int idx, len, val;
 
   Cyc_check_bvec(data, bv);
-  Cyc_check_num(data, k);
-  Cyc_check_num(data, b);
+  Cyc_check_fixnum(data, k);
+  Cyc_check_fixnum(data, b);
 
   buf = ((bytevector) bv)->data;
   idx = unbox_number(k);
@@ -2575,20 +3035,46 @@ object Cyc_bytevector_length(void *data, object bv)
 object Cyc_list2vector(void *data, object cont, object l)
 {
   object v = NULL;
-  object len;
+  object len_obj;
   object lst = l;
-  int i = 0;
+  int len, i = 0;
+  size_t element_vec_size;
 
+  make_c_opaque(opq, NULL);
   Cyc_check_pair_or_null(data, l);
-  len = Cyc_length(data, l);
-  v = alloca(sizeof(vector_type));
-  ((vector) v)->hdr.mark = gc_color_red;
-  ((vector) v)->hdr.grayed = 0;
-  ((vector) v)->tag = vector_tag;
-  ((vector) v)->num_elements = obj_obj2int(len);
-  ((vector) v)->elements =
-      (((vector) v)->num_elements > 0) ?
-      (object *) alloca(sizeof(object) * ((vector) v)->num_elements) : NULL;
+  len_obj = Cyc_length(data, l);
+  len = obj_obj2int(len_obj);
+  element_vec_size = sizeof(object) * len;
+  if (element_vec_size >= MAX_STACK_OBJ) {
+    int heap_grown;
+    v = gc_alloc(((gc_thread_data *)data)->heap, 
+                 sizeof(vector_type) + element_vec_size,
+                 boolean_f, // OK to populate manually over here
+                 (gc_thread_data *)data, 
+                 &heap_grown);
+    ((vector) v)->hdr.mark = ((gc_thread_data *)data)->gc_alloc_color;
+    ((vector) v)->hdr.grayed = 0;
+    ((vector) v)->tag = vector_tag;
+    ((vector) v)->num_elements = len;
+    ((vector) v)->elements = (object *)(((char *)v) + sizeof(vector_type));
+    // TODO: do we need to worry about stack object in the list????
+    //// Use write barrier to ensure fill is moved to heap if it is on the stack
+    //// Otherwise if next minor GC misses fill it could be catastrophic
+    //car(&tmp_pair) = fill;
+    //add_mutation(data, &tmp_pair, -1, fill);
+    // Add a special object to indicate full vector must be scanned by GC
+    opaque_ptr(&opq) = v;
+    add_mutation(data, &opq, -1, v);
+  } else {
+    v = alloca(sizeof(vector_type));
+    ((vector) v)->hdr.mark = gc_color_red;
+    ((vector) v)->hdr.grayed = 0;
+    ((vector) v)->tag = vector_tag;
+    ((vector) v)->num_elements = len;
+    ((vector) v)->elements =
+        (((vector) v)->num_elements > 0) ?
+        (object *) alloca(element_vec_size) : NULL;
+  }
   while ((lst != NULL)) {
     ((vector) v)->elements[i++] = car(lst);
     lst = cdr(lst);
@@ -2624,7 +3110,7 @@ object Cyc_char2integer(object chr)
 
 object Cyc_integer2char(void *data, object n)
 {
-  int val = 0;
+  char_type val = 0;
 
   Cyc_check_num(data, n);
   val = unbox_number(n);
@@ -2636,6 +3122,10 @@ void Cyc_halt(object obj)
 #if DEBUG_SHOW_DIAG
   gc_print_stats(Cyc_heap);
 #endif
+  if (obj_is_int(obj)) {
+    exit(obj_obj2int(obj));
+  }
+
   exit(0);
 }
 
@@ -2659,12 +3149,20 @@ static int Cyc_checked_sub(int x, int y, int *result)
   return ((((*result ^ x) & ~(*result ^ y)) >> 30) != 0);
 }
 
-// Code from http://stackoverflow.com/q/1815367/101258
 static int Cyc_checked_mul(int x, int y, int *result)
 {
+  // Avoid undefined behavior by detecting overflow prior to multiplication
+  // Based on code from Hacker's Delight and CHICKEN scheme
+  uint xu, yu, c;
+  c = (1UL<<30UL) - 1;
+  xu = x < 0 ? -x : x;
+  yu = y < 0 ? -y : y;
+
+  if (yu != 0 && xu > (c / yu)) return 1; // Overflow
+
   *result = x * y;
-  return (*result != 0 && (*result)/x != y) || // Overflow
-         (*result > CYC_FIXNUM_MAX) ||
+
+  return (*result > CYC_FIXNUM_MAX) ||
          (*result < CYC_FIXNUM_MIN);
 }
 
@@ -2741,6 +3239,33 @@ object FUNC_OP(void *data, common_type *x, object y) { \
         x->double_t.value = d OP ((double_type *)y)->value; \
     } else if (tx == bignum_tag && ty == bignum_tag) { \
         BN_OP(&(x->bignum_t.bn), &bignum_value(y), &(x->bignum_t.bn)); \
+    } else if (tx == complex_num_tag && ty == complex_num_tag) { \
+        x->complex_num_t.value = x->complex_num_t.value OP ((complex_num_type *)y)->value; \
+    } else if (tx == complex_num_tag && ty == -1) { \
+        x->complex_num_t.value = x->complex_num_t.value OP (obj_obj2int(y)); \
+    } else if (tx == complex_num_tag && ty == integer_tag) { \
+        x->complex_num_t.value = x->complex_num_t.value OP ((integer_type *)y)->value; \
+    } else if (tx == complex_num_tag && ty == bignum_tag) { \
+        x->complex_num_t.value = x->complex_num_t.value OP mp_get_double(&bignum_value(y)); \
+    } else if (tx == complex_num_tag && ty == double_tag) { \
+        x->complex_num_t.value = x->complex_num_t.value OP complex_num_value(y); \
+    } else if (tx == integer_tag && ty == complex_num_tag) { \
+        x->complex_num_t.hdr.mark = gc_color_red; \
+        x->complex_num_t.hdr.grayed = 0; \
+        x->complex_num_t.tag = complex_num_tag; \
+        x->complex_num_t.value = x->integer_t.value OP ((complex_num_type *)y)->value; \
+    } else if (tx == bignum_tag && ty == complex_num_tag) { \
+        double d = mp_get_double(&(x->bignum_t.bn)); \
+        mp_clear(&(x->bignum_t.bn)); \
+        x->complex_num_t.hdr.mark = gc_color_red; \
+        x->complex_num_t.hdr.grayed = 0; \
+        x->complex_num_t.tag = complex_num_tag; \
+        x->complex_num_t.value = d OP ((complex_num_type *)y)->value; \
+    } else if (tx == double_tag && ty == complex_num_tag) { \
+        x->complex_num_t.hdr.mark = gc_color_red; \
+        x->complex_num_t.hdr.grayed = 0; \
+        x->complex_num_t.tag = complex_num_tag; \
+        x->complex_num_t.value = x->double_t.value OP complex_num_value(y); \
     } else { \
         goto bad_arg_type_error; \
     } \
@@ -2806,6 +3331,9 @@ object Cyc_fast_sum(void *data, object ptr, object x, object y) {
         mp_add(&bnx, &bignum_value(y), &bignum_value(bn));
         mp_clear(&bnx);
         return bn;
+    } else if (is_object_type(y) && type_of(y) == complex_num_tag) {
+      assign_complex_num(ptr, ((obj_obj2int(x)) + complex_num_value(y)));
+      return ptr;
     }
   }
   // x is double
@@ -2818,6 +3346,9 @@ object Cyc_fast_sum(void *data, object ptr, object x, object y) {
       return ptr;
     } else if (is_object_type(y) && type_of(y) == bignum_tag) {
       assign_double(ptr, double_value(x) + mp_get_double(&bignum_value(y)));
+      return ptr;
+    } else if (is_object_type(y) && type_of(y) == complex_num_tag) {
+      assign_complex_num(ptr, double_value(x) + complex_num_value(y));
       return ptr;
     }
   }
@@ -2838,6 +3369,25 @@ object Cyc_fast_sum(void *data, object ptr, object x, object y) {
       alloc_bignum(data, bn);
       mp_add(&bignum_value(x), &bignum_value(y), &bignum_value(bn));
       return bn;
+    } else if (is_object_type(y) && type_of(y) == complex_num_tag) {
+      assign_complex_num(ptr, mp_get_double(&bignum_value(x)) + complex_num_value(y));
+      return ptr;
+    }
+  }
+  // x is complex
+  if (is_object_type(x) && type_of(x) == complex_num_tag) {
+    if (obj_is_int(y)){
+      assign_complex_num(ptr, complex_num_value(x) + (double)(obj_obj2int(y)));
+      return ptr;
+    } else if (is_object_type(y) && type_of(y) == double_tag) {
+      assign_complex_num(ptr, complex_num_value(x) + double_value(y));
+      return ptr;
+    } else if (is_object_type(y) && type_of(y) == complex_num_tag) {
+      assign_complex_num(ptr, complex_num_value(x) + complex_num_value(y));
+      return ptr;
+    } else if (is_object_type(y) && type_of(y) == bignum_tag) {
+      assign_complex_num(ptr, complex_num_value(x) + mp_get_double(&bignum_value(y)));
+      return ptr;
     }
   }
   // still here, raise an error 
@@ -2881,6 +3431,9 @@ object Cyc_fast_sub(void *data, object ptr, object x, object y) {
         mp_sub(&bnx, &bignum_value(y), &bignum_value(bn));
         mp_clear(&bnx);
         return bn;
+    } else if (is_object_type(y) && type_of(y) == complex_num_tag) {
+      assign_complex_num(ptr, ((obj_obj2int(x)) - complex_num_value(y)));
+      return ptr;
     }
   }
   // x is double
@@ -2893,6 +3446,9 @@ object Cyc_fast_sub(void *data, object ptr, object x, object y) {
       return ptr;
     } else if (is_object_type(y) && type_of(y) == bignum_tag) {
       assign_double(ptr, double_value(x) - mp_get_double(&bignum_value(y)));
+      return ptr;
+    } else if (is_object_type(y) && type_of(y) == complex_num_tag) {
+      assign_complex_num(ptr, double_value(x) - complex_num_value(y));
       return ptr;
     }
   }
@@ -2913,6 +3469,25 @@ object Cyc_fast_sub(void *data, object ptr, object x, object y) {
       alloc_bignum(data, bn);
       mp_sub(&bignum_value(x), &bignum_value(y), &bignum_value(bn));
       return bn;
+    } else if (is_object_type(y) && type_of(y) == complex_num_tag) {
+      assign_complex_num(ptr, mp_get_double(&bignum_value(x)) - complex_num_value(y));
+      return ptr;
+    }
+  }
+  // x is complex
+  if (is_object_type(x) && type_of(x) == complex_num_tag) {
+    if (obj_is_int(y)){
+      assign_complex_num(ptr, complex_num_value(x) - (double)(obj_obj2int(y)));
+      return ptr;
+    } else if (is_object_type(y) && type_of(y) == double_tag) {
+      assign_complex_num(ptr, complex_num_value(x) - double_value(y));
+      return ptr;
+    } else if (is_object_type(y) && type_of(y) == complex_num_tag) {
+      assign_complex_num(ptr, complex_num_value(x) - complex_num_value(y));
+      return ptr;
+    } else if (is_object_type(y) && type_of(y) == bignum_tag) {
+      assign_complex_num(ptr, complex_num_value(x) - mp_get_double(&bignum_value(y)));
+      return ptr;
     }
   }
   // still here, raise an error 
@@ -2956,6 +3531,9 @@ object Cyc_fast_mul(void *data, object ptr, object x, object y) {
         mp_mul(&bnx, &bignum_value(y), &bignum_value(bn));
         mp_clear(&bnx);
         return bn;
+    } else if (is_object_type(y) && type_of(y) == complex_num_tag) {
+      assign_complex_num(ptr, ((obj_obj2int(x)) * complex_num_value(y)));
+      return ptr;
     }
   }
   // x is double
@@ -2968,6 +3546,9 @@ object Cyc_fast_mul(void *data, object ptr, object x, object y) {
       return ptr;
     } else if (is_object_type(y) && type_of(y) == bignum_tag) {
       assign_double(ptr, double_value(x) * mp_get_double(&bignum_value(y)));
+      return ptr;
+    } else if (is_object_type(y) && type_of(y) == complex_num_tag) {
+      assign_complex_num(ptr, double_value(x) * complex_num_value(y));
       return ptr;
     }
   }
@@ -2988,6 +3569,25 @@ object Cyc_fast_mul(void *data, object ptr, object x, object y) {
       alloc_bignum(data, bn);
       mp_mul(&bignum_value(x), &bignum_value(y), &bignum_value(bn));
       return bn;
+    } else if (is_object_type(y) && type_of(y) == complex_num_tag) {
+      assign_complex_num(ptr, mp_get_double(&bignum_value(x)) * complex_num_value(y));
+      return ptr;
+    }
+  }
+  // x is complex
+  if (is_object_type(x) && type_of(x) == complex_num_tag) {
+    if (obj_is_int(y)){
+      assign_complex_num(ptr, complex_num_value(x) * (double)(obj_obj2int(y)));
+      return ptr;
+    } else if (is_object_type(y) && type_of(y) == double_tag) {
+      assign_complex_num(ptr, complex_num_value(x) * double_value(y));
+      return ptr;
+    } else if (is_object_type(y) && type_of(y) == complex_num_tag) {
+      assign_complex_num(ptr, complex_num_value(x) * complex_num_value(y));
+      return ptr;
+    } else if (is_object_type(y) && type_of(y) == bignum_tag) {
+      assign_complex_num(ptr, complex_num_value(x) * mp_get_double(&bignum_value(y)));
+      return ptr;
     }
   }
   // still here, raise an error 
@@ -3021,6 +3621,9 @@ object Cyc_fast_div(void *data, object ptr, object x, object y) {
         mp_div(&bnx, &bignum_value(y), &bignum_value(bn), NULL);
         mp_clear(&bnx);
         return bn;
+    } else if (is_object_type(y) && type_of(y) == complex_num_tag) {
+      assign_complex_num(ptr, ((obj_obj2int(x)) / complex_num_value(y)));
+      return ptr;
     }
   }
   // x is double
@@ -3033,6 +3636,9 @@ object Cyc_fast_div(void *data, object ptr, object x, object y) {
       return ptr;
     } else if (is_object_type(y) && type_of(y) == bignum_tag) {
       assign_double(ptr, double_value(x) / mp_get_double(&bignum_value(y)));
+      return ptr;
+    } else if (is_object_type(y) && type_of(y) == complex_num_tag) {
+      assign_complex_num(ptr, double_value(x) / complex_num_value(y));
       return ptr;
     }
   }
@@ -3053,6 +3659,25 @@ object Cyc_fast_div(void *data, object ptr, object x, object y) {
       alloc_bignum(data, bn);
       mp_div(&bignum_value(x), &bignum_value(y), &bignum_value(bn), NULL);
       return bn;
+    } else if (is_object_type(y) && type_of(y) == complex_num_tag) {
+      assign_complex_num(ptr, mp_get_double(&bignum_value(x)) / complex_num_value(y));
+      return ptr;
+    }
+  }
+  // x is complex
+  if (is_object_type(x) && type_of(x) == complex_num_tag) {
+    if (obj_is_int(y)){
+      assign_complex_num(ptr, complex_num_value(x) / (double)(obj_obj2int(y)));
+      return ptr;
+    } else if (is_object_type(y) && type_of(y) == double_tag) {
+      assign_complex_num(ptr, complex_num_value(x) / double_value(y));
+      return ptr;
+    } else if (is_object_type(y) && type_of(y) == complex_num_tag) {
+      assign_complex_num(ptr, complex_num_value(x) / complex_num_value(y));
+      return ptr;
+    } else if (is_object_type(y) && type_of(y) == bignum_tag) {
+      assign_complex_num(ptr, complex_num_value(x) / mp_get_double(&bignum_value(y)));
+      return ptr;
     }
   }
   // still here, raise an error 
@@ -3123,6 +3748,33 @@ object Cyc_div_op(void *data, common_type * x, object y)
     x->double_t.value = d / ((double_type *)y)->value;
   } else if (tx == bignum_tag && ty == bignum_tag) {
     mp_div(&(x->bignum_t.bn), &bignum_value(y), &(x->bignum_t.bn), NULL);
+  } else if (tx == complex_num_tag && ty == complex_num_tag) {
+      x->complex_num_t.value = x->complex_num_t.value / ((complex_num_type *)y)->value;
+  } else if (tx == complex_num_tag && ty == -1) {
+      x->complex_num_t.value = x->complex_num_t.value / (obj_obj2int(y));
+  } else if (tx == complex_num_tag && ty == integer_tag) {
+      x->complex_num_t.value = x->complex_num_t.value / ((integer_type *)y)->value;
+  } else if (tx == complex_num_tag && ty == bignum_tag) {
+      x->complex_num_t.value = x->complex_num_t.value / mp_get_double(&bignum_value(y));
+  } else if (tx == complex_num_tag && ty == double_tag) {
+      x->complex_num_t.value = x->complex_num_t.value / complex_num_value(y);
+  } else if (tx == integer_tag && ty == complex_num_tag) {
+      x->complex_num_t.hdr.mark = gc_color_red;
+      x->complex_num_t.hdr.grayed = 0;
+      x->complex_num_t.tag = complex_num_tag;
+      x->complex_num_t.value = x->integer_t.value / ((complex_num_type *)y)->value;
+  } else if (tx == bignum_tag && ty == complex_num_tag) {
+      double d = mp_get_double(&(x->bignum_t.bn));
+      mp_clear(&(x->bignum_t.bn));
+      x->complex_num_t.hdr.mark = gc_color_red;
+      x->complex_num_t.hdr.grayed = 0;
+      x->complex_num_t.tag = complex_num_tag;
+      x->complex_num_t.value = d / ((complex_num_type *)y)->value;
+  } else if (tx == double_tag && ty == complex_num_tag) {
+      x->complex_num_t.hdr.mark = gc_color_red;
+      x->complex_num_t.hdr.grayed = 0;
+      x->complex_num_t.tag = complex_num_tag;
+      x->complex_num_t.value = x->double_t.value / complex_num_value(y);
   } else {
     goto bad_arg_type_error;
   }
@@ -3203,6 +3855,11 @@ object Cyc_num_op_va_list(void *data, int argc,
     buf->bignum_t.hdr.grayed = 0;
     buf->bignum_t.tag = bignum_tag;
     mp_init_copy(&(buf->bignum_t.bn), &bignum_value(n));
+  } else if (type_of(n) == complex_num_tag) {
+    buf->complex_num_t.hdr.mark = gc_color_red;
+    buf->complex_num_t.hdr.grayed = 0;
+    buf->complex_num_t.tag = complex_num_tag;
+    buf->complex_num_t.value = ((complex_num_type *) n)->value;
   } else {
     goto bad_arg_type_error;
   }
@@ -3221,6 +3878,9 @@ object Cyc_num_op_va_list(void *data, int argc,
     } else if (type_of(&tmp) == double_tag){
       buf->double_t.tag = double_tag;
       buf->double_t.value = double_value(&tmp);
+    } else if (type_of(&tmp) == complex_num_tag){
+      buf->complex_num_t.tag = complex_num_tag;
+      buf->complex_num_t.value = complex_num_value(&tmp);
     } else {
       buf->bignum_t.tag = bignum_tag;
       buf->bignum_t.bn.used = tmp.bignum_t.bn.used;
@@ -4022,8 +4682,8 @@ void _symbol_127(void *data, object cont, object args)
 
 void _Cyc_91get_91cvar(void *data, object cont, object args)
 {
-  printf("not implemented\n");
-  exit(1);
+  Cyc_check_num_args(data, "Cyc-get-cvar", 1, args);
+  return_closcall1(data, cont, Cyc_get_cvar((car(args))));
 }
 
 void _Cyc_91set_91cvar_67(void *data, object cont, object args)
@@ -4645,12 +5305,31 @@ void Cyc_start_trampoline(gc_thread_data * thd)
   exit(1);
 }
 
+/**
+ * @brief A helper function for calling `gc_mark_globals`.
+ */
 void gc_request_mark_globals(void)
 {
   gc_mark_globals(Cyc_global_variables, global_table);
 }
 
-char *gc_fixup_moved_obj(gc_thread_data * thd, int *alloci, char *obj,
+/**
+ * @brief Add an object to the move buffer
+ * @param d Mutator data object containing the buffer
+ * @param alloci  Pointer to the next open slot in the buffer
+ * @param obj     Object to add
+ */
+static void gc_thr_add_to_move_buffer(gc_thread_data * d, int *alloci, object obj)
+{
+  if (*alloci == d->moveBufLen) {
+    gc_thr_grow_move_buffer(d);
+  }
+
+  d->moveBuf[*alloci] = obj;
+  (*alloci)++;
+}
+
+static char *gc_fixup_moved_obj(gc_thread_data * thd, int *alloci, char *obj,
                          object hp)
 {
   int acquired_lock = 0;
@@ -4674,7 +5353,7 @@ char *gc_fixup_moved_obj(gc_thread_data * thd, int *alloci, char *obj,
   return (char *)hp;
 }
 
-char *gc_move(char *obj, gc_thread_data * thd, int *alloci, int *heap_grown)
+static char *gc_move(char *obj, gc_thread_data * thd, int *alloci, int *heap_grown)
 {
   gc_heap_root *heap = thd->heap;
   if (!is_object_type(obj))
@@ -4765,6 +5444,11 @@ char *gc_move(char *obj, gc_thread_data * thd, int *alloci, int *heap_grown)
           gc_alloc(heap, sizeof(integer_type), obj, thd, heap_grown);
       return gc_fixup_moved_obj(thd, alloci, obj, hp);
     }
+  case complex_num_tag:{
+      complex_num_type *hp =
+          gc_alloc(heap, sizeof(complex_num_type), obj, thd, heap_grown);
+      return gc_fixup_moved_obj(thd, alloci, obj, hp);
+    }
   default:
     fprintf(stderr, "gc_move: bad tag obj=%p obj.tag=%d\n", (object) obj,
             type_of(obj));
@@ -4781,6 +5465,11 @@ char *gc_move(char *obj, gc_thread_data * thd, int *alloci, int *heap_grown)
   } \
 }
 
+/**
+ * @brief Trigger a minor GC for the calling thread.
+ * @param data Thread data object for the caller.
+ * @param cont Continuation to invoke after GC.
+ */
 object Cyc_trigger_minor_gc(void *data, object cont)
 {
   gc_thread_data *thd = (gc_thread_data *) data;
@@ -4910,6 +5599,7 @@ int gc_minor(void *data, object low_limit, object high_limit, closure cont,
     case port_tag:
     case cvar_tag:
     case c_opaque_tag:
+    case complex_num_tag:
       break;
       // These types are not heap-allocated
     case eof_tag:
@@ -5502,21 +6192,29 @@ void Cyc_exit_thread(gc_thread_data * thd)
   pthread_exit(NULL);           // For now, just a proof of concept
 }
 
-// For now, accept a number of milliseconds to sleep
+/**
+ * @brief Accept a number of seconds to sleep according to SRFI-18
+ */
 object Cyc_thread_sleep(void *data, object timeout)
 {
   struct timespec tim;
-  long value;
+  double value;
   Cyc_check_num(data, timeout);
   value = unbox_number(timeout);
-  tim.tv_sec = value / 1000;
-  tim.tv_nsec = (value % 1000) * NANOSECONDS_PER_MILLISECOND;
+  tim.tv_sec = (long)value;
+  tim.tv_nsec = (long)((value - tim.tv_sec) * 1000 * NANOSECONDS_PER_MILLISECOND);
   nanosleep(&tim, NULL);
   return boolean_t;
 }
 
-// Copy given object to the heap, if it is from the stack.
-// This function is intended to be called directly from application code
+/**
+ * @brief Copy given object to the heap, if it is from the stack.
+ *        This function is intended to be called directly from application code.
+ *        Note that only a shallow-copy is performed! For example, a pair object
+ *        would be copied to the heap but its `car` and `cdr` objects would not.
+ * @param data Thread data object for the caller.
+ * @param obj Object to copy.
+ */
 object copy2heap(void *data, object obj)
 {
   char stack_pos;
@@ -5566,6 +6264,20 @@ object Cyc_bit_set(void *data, object n1, object n2)
   Cyc_check_int(data, n2);
   return (obj_int2obj( 
             obj_obj2int(n1) | obj_obj2int(n2)));
+}
+
+object Cyc_num2double(void *data, object ptr, object z)
+{
+ return_inexact_double_op_no_cps(data, ptr, (double), z);
+}
+
+void Cyc_make_rectangular(void *data, object k, object r, object i) 
+{
+  double_type dr, di;
+  Cyc_num2double(data, &dr, r);
+  Cyc_num2double(data, &di, i);
+  make_complex_num(num, double_value(&dr), double_value(&di));
+  return_closcall1(data, k, &num);
 }
 
 /* RNG section */
@@ -5635,7 +6347,7 @@ void Cyc_import_shared_object(void *data, object cont, object filename, object e
   handle = dlopen(string_str(filename), RTLD_GLOBAL | RTLD_LAZY);
   if (handle == NULL) {
     snprintf(buffer, 256, "%s", dlerror());
-    make_string(s, buffer);
+    make_utf8_string(data, s, buffer);
     Cyc_rt_raise2(data, "Unable to import library", &s);
   }
   dlerror();    /* Clear any existing error */
@@ -5643,7 +6355,7 @@ void Cyc_import_shared_object(void *data, object cont, object filename, object e
   entry_pt = (function_type) dlsym(handle, string_str(entry_pt_fnc));
   if (entry_pt == NULL) {
     snprintf(buffer, 256, "%s, %s, %s", string_str(filename), string_str(entry_pt_fnc), dlerror());
-    make_string(s, buffer);
+    make_utf8_string(data, s, buffer);
     Cyc_rt_raise2(data, "Unable to load symbol", &s);
   }
   mclosure1(clo, entry_pt, cont);
@@ -5683,7 +6395,7 @@ int read_from_port(port_type *p)
  * @param p Input port
  * @param msg Error message
  */
-void _read_error(void *data, port_type *p, const char *msg) 
+static void _read_error(void *data, port_type *p, const char *msg) 
 {
   char buf[1024];
   snprintf(buf, 1023, "(line %d, column %d): %s", 
@@ -5692,18 +6404,19 @@ void _read_error(void *data, port_type *p, const char *msg)
   // the cont could receive an error and raise it though
   //Cyc_rt_raise_msg(data, buf);
   make_string(str, buf);
+  str.num_cp = Cyc_utf8_count_code_points((uint8_t *)buf);
   make_empty_vector(vec);
   vec.num_elements = 1;
   vec.elements = (object *) alloca(sizeof(object) * vec.num_elements);
   vec.elements[0] = &str;
-  return_thread_runnable(data, &vec);
+  return_thread_runnable_with_obj(data, &vec, p);
 }
 
 /**
  * @brief Helper function to read past a comment
  * @param p Input port
  */
-void _read_line_comment(port_type *p)
+static void _read_line_comment(port_type *p)
 {
   while(1) {
     // Read more data into buffer, if needed
@@ -5724,7 +6437,7 @@ void _read_line_comment(port_type *p)
  * @brief Helper function to read past a block comment
  * @param p Input port
  */
-void _read_multiline_comment(port_type *p)
+static void _read_multiline_comment(port_type *p)
 {
   int maybe_end = 0;
 
@@ -5761,7 +6474,7 @@ void _read_multiline_comment(port_type *p)
  * @brief Helper function to read past whitespace characters
  * @param p Input port
  */
-void _read_whitespace(port_type *p) 
+static void _read_whitespace(port_type *p) 
 {
   while(1) {
     // Read more data into buffer, if needed
@@ -5805,12 +6518,43 @@ static void _read_add_to_tok_buf(port_type *p, char c)
 }
 
 /**
+ * @brief Determine if given string is numeric
+ */
+static int _read_is_numeric(const char *tok, int len)
+{
+  return (len &&
+          ((isdigit(tok[0])) ||
+           ((len > 1) && tok[0] == '.' && isdigit(tok[1])) ||
+           ((len > 1) && (tok[1] == '.' || isdigit(tok[1])) && (tok[0] == '-' || tok[0] == '+'))));
+}
+
+/**
+ * @brief Determine if given string is a complex number
+ */
+static int _read_is_complex_number(const char *tok, int len)
+{
+  // Assumption: tok already passed checks from _read_is_numeric
+  return (tok[len - 1] == 'i' ||
+          tok[len - 1] == 'I');
+}
+
+/**
+ * @brief Helper function, determine if given number is a hex digit
+ * @param c Character to check
+ */
+static int _read_is_hex_digit(char c)
+{
+  return (c >= 'a' && c <= 'f') ||
+         (c >= 'A' && c <= 'F');
+}
+
+/**
  * @brief Helper function to read a string
  * @param data Thread data object
  * @param cont Current continuation
  * @param p Input port
  */
-void _read_string(void *data, object cont, port_type *p) 
+static void _read_string(void *data, object cont, port_type *p) 
 {
   char c;
   int escaped = 0;
@@ -5863,6 +6607,12 @@ void _read_string(void *data, object cont, port_type *p)
             p->buf_idx++;
             break;
           }
+          // Verify if hex digit is valid
+          if (!isdigit(p->mem_buf[p->buf_idx]) && 
+              !_read_is_hex_digit(p->mem_buf[p->buf_idx])) {
+            p->buf_idx++;
+            _read_error(data, p, "invalid hex digit in string");
+          }
           buf[i] = p->mem_buf[p->buf_idx];
           p->buf_idx++;
           p->col_num++;
@@ -5870,8 +6620,14 @@ void _read_string(void *data, object cont, port_type *p)
         }
         buf[i] = '\0';
         {
-          int result = (int)strtol(buf, NULL, 16);
-          p->tok_buf[p->tok_end++] = (char)result;
+          char_type result = strtol(buf, NULL, 16);
+          char cbuf[5];
+          int i;
+          Cyc_utf8_encode_char(cbuf, 5, result);
+          for (i = 0; cbuf[i] != 0; i++) {
+            _read_add_to_tok_buf(p, cbuf[i]);
+          }
+          //p->tok_buf[p->tok_end++] = (char)result;
         }
         break;
       }
@@ -5883,8 +6639,8 @@ void _read_string(void *data, object cont, port_type *p)
       p->tok_buf[p->tok_end] = '\0'; // TODO: what if buffer is full?
       p->tok_end = 0; // Reset for next atom
       {
-        make_string(str, p->tok_buf);
-        return_thread_runnable(data, &str);
+        make_utf8_string(data, str, p->tok_buf);
+        return_thread_runnable_with_obj(data, &str, p);
       }
     } else if (c == '\\') {
       escaped = 1;
@@ -5903,9 +6659,10 @@ void _read_string(void *data, object cont, port_type *p)
  * @param data Thread data object
  * @param p Input port
  */
-void _read_literal_identifier(void *data, port_type *p) 
+static void _read_literal_identifier(void *data, port_type *p) 
 {
   char c;
+  int escaped = 0;
   while(1) {
     // Read more data into buffer, if needed
     if (p->buf_idx == p->mem_buf_len) {
@@ -5916,13 +6673,82 @@ void _read_literal_identifier(void *data, port_type *p)
     c = p->mem_buf[p->buf_idx++];
     p->col_num++;
 
-    if (c == '|') {
+    if (escaped) {
+      escaped = 0;
+      switch (c) {
+      case '"':
+      case '\'':
+      case '?':
+      case '|':
+      case '\\':
+        _read_add_to_tok_buf(p, c);
+        break;
+      case 'a':
+        _read_add_to_tok_buf(p, '\a');
+        break;
+      case 'b':
+        _read_add_to_tok_buf(p, '\b');
+        break;
+      case 'n':
+        _read_add_to_tok_buf(p, '\n');
+        break;
+      case 'r':
+        _read_add_to_tok_buf(p, '\r');
+        break;
+      case 't':
+        _read_add_to_tok_buf(p, '\t');
+        break;
+      case 'x': {
+        char buf[32];
+        int i = 0;
+        while (i < 31){
+          if (p->mem_buf_len == 0 || p->mem_buf_len == p->buf_idx) { 
+            int rv = read_from_port(p); 
+            if (!rv) { 
+              break;
+            }
+          }
+          if (p->mem_buf[p->buf_idx] == ';'){
+            p->buf_idx++;
+            break;
+          }
+          // Verify if hex digit is valid
+          if (!isdigit(p->mem_buf[p->buf_idx]) && 
+              !_read_is_hex_digit(p->mem_buf[p->buf_idx])) {
+            p->buf_idx++;
+            _read_error(data, p, "invalid hex digit in literal identifier");
+          }
+          buf[i] = p->mem_buf[p->buf_idx];
+          p->buf_idx++;
+          p->col_num++;
+          i++;
+        }
+        buf[i] = '\0';
+        {
+          char_type result = strtol(buf, NULL, 16);
+          char cbuf[5];
+          int i;
+          Cyc_utf8_encode_char(cbuf, 5, result);
+          for (i = 0; cbuf[i] != 0; i++) {
+            _read_add_to_tok_buf(p, cbuf[i]);
+          }
+          //p->tok_buf[p->tok_end++] = (char)result;
+        }
+        break;
+      }
+      default:
+        _read_error(data, p, "invalid escape character in literal identifier"); // TODO: char
+        break;
+      }
+    } else if (c == '|') {
       p->tok_buf[p->tok_end] = '\0'; // TODO: what if buffer is full?
       p->tok_end = 0; // Reset for next atom
       {
         object sym = find_or_add_symbol(p->tok_buf);
-        return_thread_runnable(data, sym);
+        return_thread_runnable_with_obj(data, sym, p);
       }
+    } else if (c == '\\') {
+      escaped = 1;
     } else if (c == '\n') {
       p->line_num++;
       p->col_num = 1;
@@ -5938,38 +6764,54 @@ void _read_literal_identifier(void *data, port_type *p)
  * @param data Thread data object
  * @param p Input port
  */
-void _read_return_character(void *data, port_type *p)
+static void _read_return_character(void *data, port_type *p)
 {
   p->tok_buf[p->tok_end] = '\0'; // TODO: what if buffer is full?
   p->tok_end = 0; // Reset for next atom
   if (strlen(p->tok_buf) == 1) {
-    return_thread_runnable(data, obj_char2obj(p->tok_buf[0]));
+    // ASCII char, consider merging with below?
+    return_thread_runnable_with_obj(data, obj_char2obj(p->tok_buf[0]), p);
   } else if(strncmp(p->tok_buf, "alarm", 5) == 0) {
-    return_thread_runnable(data, obj_char2obj('\a'));
+    return_thread_runnable_with_obj(data, obj_char2obj('\a'), p);
   } else if(strncmp(p->tok_buf, "backspace", 9) == 0) {
-    return_thread_runnable(data, obj_char2obj('\b'));
+    return_thread_runnable_with_obj(data, obj_char2obj('\b'), p);
   } else if(strncmp(p->tok_buf, "delete", 6) == 0) {
-    return_thread_runnable(data, obj_char2obj(127));
+    return_thread_runnable_with_obj(data, obj_char2obj(127), p);
   } else if(strncmp(p->tok_buf, "escape", 6) == 0) {
-    return_thread_runnable(data, obj_char2obj(27));
+    return_thread_runnable_with_obj(data, obj_char2obj(27), p);
   } else if(strncmp(p->tok_buf, "newline", 7) == 0) {
-    return_thread_runnable(data, obj_char2obj('\n'));
+    return_thread_runnable_with_obj(data, obj_char2obj('\n'), p);
   } else if(strncmp(p->tok_buf, "null", 4) == 0) {
-    return_thread_runnable(data, obj_char2obj('\0'));
+    return_thread_runnable_with_obj(data, obj_char2obj('\0'), p);
   } else if(strncmp(p->tok_buf, "return", 6) == 0) {
-    return_thread_runnable(data, obj_char2obj('\r'));
+    return_thread_runnable_with_obj(data, obj_char2obj('\r'), p);
   } else if(strncmp(p->tok_buf, "space", 5) == 0) {
-    return_thread_runnable(data, obj_char2obj(' '));
+    return_thread_runnable_with_obj(data, obj_char2obj(' '), p);
   } else if(strncmp(p->tok_buf, "tab", 3) == 0) {
-    return_thread_runnable(data, obj_char2obj('\t'));
+    return_thread_runnable_with_obj(data, obj_char2obj('\t'), p);
   } else if(strlen(p->tok_buf) > 1 && p->tok_buf[0] == 'x') {
     const char *buf = p->tok_buf + 1;
-    int result = strtol(buf, NULL, 16);
-    return_thread_runnable(data, obj_char2obj(result));
+    char_type result = strtol(buf, NULL, 16);
+    return_thread_runnable_with_obj(data, obj_char2obj(result), p);
   } else {
-    char buf[31];
-    snprintf(buf, 30, "Unable to parse character %s", p->tok_buf);
-    _read_error(data, p, buf);
+    // Try to read a UTF-8 char and if so return it, otherwise throw an error
+    uint32_t state = CYC_UTF8_ACCEPT;
+    char_type codepoint;
+    uint8_t *s = (uint8_t *)p->tok_buf;
+    while(s) {
+      if (!Cyc_utf8_decode(&state, &codepoint, *s)) {
+        s++;
+        break;
+      }
+      s++;
+    }
+    if (state == CYC_UTF8_ACCEPT && *s == '\0') {
+      return_thread_runnable_with_obj(data, obj_char2obj(codepoint), p);
+    } else {
+      char buf[31];
+      snprintf(buf, 30, "Unable to parse character %s", p->tok_buf);
+      _read_error(data, p, buf);
+    }
   }
 }
 
@@ -5978,7 +6820,7 @@ void _read_return_character(void *data, port_type *p)
  * @param data Thread data object
  * @param p Input port
  */
-void _read_character(void *data, port_type *p) 
+static void _read_character(void *data, port_type *p) 
 {
   char c;
   while(1) {
@@ -6002,35 +6844,13 @@ void _read_character(void *data, port_type *p)
 }
 
 /**
- * @brief Determine if given string is numeric
- */
-int _read_is_numeric(const char *tok)
-{
-  int len = strlen(tok);
-  return (len &&
-          ((isdigit(tok[0])) ||
-           ((len > 1) && tok[0] == '.' && isdigit(tok[1])) ||
-           ((len > 1) && (tok[1] == '.' || isdigit(tok[1])) && (tok[0] == '-' || tok[0] == '+'))));
-}
-
-/**
- * @brief Helper function, determine if given number is a hex digit
- * @param c Character to check
- */
-int _read_is_hex_digit(char c)
-{
-  return (c >= 'a' && c <= 'f') ||
-         (c >= 'A' && c <= 'F');
-}
-
-/**
  * @brief Helper function, return read number.
  * @param data Thread data object
  * @param p Input port
  * @param base Number base
  * @param exact Return an exact number if true
  */
-void _read_return_number(void *data, port_type *p, int base, int exact)
+static void _read_return_number(void *data, port_type *p, int base, int exact)
 {
   // TODO: validation?
   p->tok_buf[p->tok_end] = '\0'; // TODO: what if buffer is full?
@@ -6042,7 +6862,38 @@ void _read_return_number(void *data, port_type *p, int base, int exact)
   vec.elements[0] = &str;
   vec.elements[1] = obj_int2obj(base);
   vec.elements[2] = exact ? boolean_t : boolean_f;
-  return_thread_runnable(data, &vec);
+  return_thread_runnable_with_obj(data, &vec, p);
+}
+
+/**
+ * @brief Helper function, parse&return read complex number.
+ * @param data Thread data object
+ * @param p Input port
+ * @param base Number base
+ * @param exact Return an exact number if true
+ */
+static void _read_return_complex_number(void *data, port_type *p, int len)
+{
+//      TODO: return complex num, see _read_return_number for possible template
+//      probably want to have that function extract/identify the real/imaginary components.
+//      can just scan the buffer and read out start/end index of each number.
+  int i;
+  make_empty_vector(vec);
+  make_string(str, p->tok_buf);
+  vec.num_elements = 2;
+  vec.elements = (object *) alloca(sizeof(object) * vec.num_elements);
+  vec.elements[0] = &str;
+  i = 0;
+  if (p->tok_buf[0] == '-' || p->tok_buf[0] == '+') {
+    i++;
+  }
+  for (; i < len; i++) {
+    if (!isdigit(p->tok_buf[i]) && p->tok_buf[i] != '.' && p->tok_buf[i] != 'e' && p->tok_buf[i] != 'E') {
+      break;
+    }
+  }
+  vec.elements[1] = obj_int2obj(i);
+  return_thread_runnable_with_obj(data, &vec, p);
 }
 
 /**
@@ -6052,7 +6903,7 @@ void _read_return_number(void *data, port_type *p, int base, int exact)
  * @param base Number base
  * @param exact Return an exact number if true
  */
-void _read_number(void *data, port_type *p, int base, int exact) 
+static void _read_number(void *data, port_type *p, int base, int exact) 
 {
   char c;
   while(1) {
@@ -6089,9 +6940,10 @@ void _read_number(void *data, port_type *p, int base, int exact)
  * @param cont Current continuation
  * @param p Input port
  */
-void _read_return_atom(void *data, object cont, port_type *p) 
+static void _read_return_atom(void *data, object cont, port_type *p) 
 {
   object sym;
+  int len = p->tok_end;
 
   // Back up a char, since we always get here after reaching a terminal char
   // indicating we have the full atom
@@ -6100,21 +6952,26 @@ void _read_return_atom(void *data, object cont, port_type *p)
   p->tok_buf[p->tok_end] = '\0'; // TODO: what if buffer is full?
   p->tok_end = 0; // Reset for next atom
 
-  if (_read_is_numeric(p->tok_buf)) {
+  if (_read_is_numeric(p->tok_buf, len)) {
     make_string(str, p->tok_buf);
+    str.num_cp = Cyc_utf8_count_code_points((uint8_t *)(p->tok_buf));
     make_c_opaque(opq, &str);
-    return_thread_runnable(data, &opq);
+    if (_read_is_complex_number(p->tok_buf, len)) {
+      _read_return_complex_number(data, p, len);
+    } else {
+      return_thread_runnable_with_obj(data, &opq, p);
+    }
   } else if (strncmp("+inf.0", p->tok_buf, 6) == 0 ||
              strncmp("-inf.0", p->tok_buf, 6) == 0) {
     make_double(d, pow(2.0, 1000000));
-    return_thread_runnable(data, &d);
+    return_thread_runnable_with_obj(data, &d, p);
   } else if (strncmp("+nan.0", p->tok_buf, 6) == 0 ||
              strncmp("-nan.0", p->tok_buf, 6) == 0) {
     make_double(d, 0.0 / 0.0);
-    return_thread_runnable(data, &d);
+    return_thread_runnable_with_obj(data, &d, p);
   } else {
     sym = find_or_add_symbol(p->tok_buf);
-    return_thread_runnable(data, sym);
+    return_thread_runnable_with_obj(data, sym, p);
   }
 }
 
@@ -6126,11 +6983,66 @@ void _read_return_atom(void *data, object cont, port_type *p)
    int rv = read_from_port(p); \
    if (!rv) { \
      if (p->tok_end) _read_return_atom(data, cont, p); \
-     return_thread_runnable(data, Cyc_EOF); \
+     return_thread_runnable_with_obj(data, Cyc_EOF, p); \
    } \
  } 
 
 object Cyc_io_peek_char(void *data, object cont, object port)
+{
+  FILE *stream;
+  port_type *p;
+  uint32_t state = CYC_UTF8_ACCEPT;
+  char_type codepoint;
+  int c, i = 0, at_mem_buf_end = 0;
+  char buf[5];
+
+  Cyc_check_port(data, port);
+  {
+    p = (port_type *)port;
+    stream = ((port_type *) port)->fp;
+    if (stream == NULL) {
+      Cyc_rt_raise2(data, "Unable to read from closed port: ", port);
+    }
+    set_thread_blocked(data, cont);
+    if (p->mem_buf_len == 0 || p->mem_buf_len == p->buf_idx) {
+      _read_next_char(data, cont, p);
+    }
+    c = p->mem_buf[p->buf_idx];
+    if (Cyc_utf8_decode(&state, &codepoint, (uint8_t)c)) {
+      // Only have a partial UTF8 code point, read more chars.
+      // Problem is that there may not be enough space to store them
+      // and do need to set them aside since we are just peeking here
+      // and not actually supposed to be reading past chars.
+
+      buf[0] = c;
+      i = 1;
+      while (i < 5) { // TODO: limit to 4 chars??
+        if (p->mem_buf_len == p->buf_idx + i) {
+          // No more buffered chars
+          at_mem_buf_end = 1;
+          c = fgetc(stream);
+          if (c == EOF) break; // TODO: correct to do this here????
+        } else {
+          c = p->mem_buf[p->buf_idx + i];
+        }
+        buf[i++] = c;
+        if (!Cyc_utf8_decode(&state, &codepoint, (uint8_t)c)) {
+          break;
+        }
+      }
+    }
+    if (at_mem_buf_end && c != EOF) {
+      p->buf_idx = 0;
+      p->mem_buf_len = i;
+      memmove(p->mem_buf, buf, i);
+    }
+
+    return_thread_runnable_with_obj(data, (c != EOF) ? obj_char2obj(codepoint) : Cyc_EOF, p);
+  }
+  return Cyc_EOF;
+}
+
+object Cyc_io_peek_u8(void *data, object cont, object port)
 {
   FILE *stream;
   port_type *p;
@@ -6144,9 +7056,11 @@ object Cyc_io_peek_char(void *data, object cont, object port)
       Cyc_rt_raise2(data, "Unable to read from closed port: ", port);
     }
     set_thread_blocked(data, cont);
-    _read_next_char(data, cont, p);
+    if (p->mem_buf_len == 0 || p->mem_buf_len == p->buf_idx) {
+      _read_next_char(data, cont, p);
+    }
     c = p->mem_buf[p->buf_idx];
-    return_thread_runnable(data, (c != EOF) ? obj_char2obj(c) : Cyc_EOF);
+    return_thread_runnable_with_obj(data, (c != EOF) ? obj_char2obj(c) : Cyc_EOF, p);
   }
   return Cyc_EOF;
 }
@@ -6171,17 +7085,43 @@ object Cyc_io_peek_char(void *data, object cont, object port)
 object Cyc_io_read_char(void *data, object cont, object port)
 {
   port_type *p = (port_type *)port;
-  int c;
   Cyc_check_port(data, port);
   if (p->fp == NULL) {
     Cyc_rt_raise2(data, "Unable to read from closed port: ", port);
   }
   {
+    uint32_t state = CYC_UTF8_ACCEPT;
+    char_type codepoint;
+    int c;
+    set_thread_blocked(data, cont);
+    do {
+      _read_next_char(data, cont, p);
+      c = p->mem_buf[p->buf_idx++];
+      if (c == EOF) break;
+    } while(Cyc_utf8_decode(&state, &codepoint, (uint8_t)c));
+// TODO: limit above to 4 chars and then thrown an error?
+    p->col_num++;
+    return_thread_runnable_with_obj(data, (c != EOF) ? obj_char2obj(codepoint) : Cyc_EOF, p);
+  }
+  return Cyc_EOF;
+}
+
+object Cyc_io_read_u8(void *data, object cont, object port)
+{
+  port_type *p = (port_type *)port;
+  Cyc_check_port(data, port);
+  if (p->fp == NULL) {
+    Cyc_rt_raise2(data, "Unable to read from closed port: ", port);
+  }
+  {
+    char_type codepoint;
+    int c;
     set_thread_blocked(data, cont);
     _read_next_char(data, cont, p);
     c = p->mem_buf[p->buf_idx++];
+    codepoint = (char_type) c;
     p->col_num++;
-    return_thread_runnable(data, (c != EOF) ? obj_char2obj(c) : Cyc_EOF);
+    return_thread_runnable_with_obj(data, (c != EOF) ? obj_char2obj(codepoint) : Cyc_EOF, p);
   }
   return Cyc_EOF;
 }
@@ -6190,8 +7130,10 @@ object Cyc_io_read_char(void *data, object cont, object port)
 object Cyc_io_read_line(void *data, object cont, object port)
 {
   FILE *stream = ((port_type *) port)->fp;
-  char buf[1024];
-  int len;
+  char buf[1027];
+  int len, num_cp, i = 0;
+  char_type codepoint;
+  uint32_t state;
 
   Cyc_check_port(data, port);
   if (stream == NULL) {
@@ -6200,24 +7142,40 @@ object Cyc_io_read_line(void *data, object cont, object port)
   set_thread_blocked(data, cont);
   errno = 0;
   if (fgets(buf, 1023, stream) != NULL) {
-    len = strlen(buf);
+    state = Cyc_utf8_count_code_points_and_bytes((uint8_t *)buf, &codepoint, &num_cp, &len);
+    // Check if we stopped reading in the middle of a code point and
+    // if so, read one byte at a time until that code point is finished.
+    while (state != CYC_UTF8_ACCEPT && i < 3) {
+      int c = fgetc(stream);
+      buf[len] = c;
+      len++;
+      Cyc_utf8_decode(&state, &codepoint, (uint8_t)c);
+      if (state == CYC_UTF8_ACCEPT) {
+        num_cp++;
+        break;
+      }
+      i++;
+    }
+
     {
       // Remove any trailing CR / newline chars
       while (len > 0 && (buf[len - 1] == '\n' ||
                          buf[len - 1] == '\r')) {
         len--;
+        num_cp--;
       }
       buf[len] = '\0';
       make_string_noalloc(s, buf, len);
-      return_thread_runnable(data, &s);
+      s.num_cp = num_cp;
+      return_thread_runnable_with_obj(data, &s, port);
     }
   } else {
     if (feof(stream)) {
-      return_thread_runnable(data, Cyc_EOF);
+      return_thread_runnable_with_obj(data, Cyc_EOF, port);
     } else {
       // TODO: can't do this because we said thread could be blocked
       //Cyc_rt_raise2(data, "Error reading from file: ", obj_int2obj(errno));
-      return_thread_runnable(data, Cyc_EOF);
+      return_thread_runnable_with_obj(data, Cyc_EOF, port);
     }
   }
   return NULL;
@@ -6260,7 +7218,7 @@ void Cyc_io_read_token(void *data, object cont, object port)
       if (p->tok_end) _read_return_atom(data, cont, p);
       // Special encoding so we can distinguish from chars such as #\(
       make_c_opaque(opq, obj_char2obj(c));
-      return_thread_runnable(data, &opq);
+      return_thread_runnable_with_obj(data, &opq, p);
     } else if (c == ',') {
       if (p->tok_end) _read_return_atom(data, cont, p);
 
@@ -6274,11 +7232,11 @@ void Cyc_io_read_token(void *data, object cont, object port)
         vec.elements[1] = boolean_f;
         p->buf_idx++;
         p->col_num++;
-        return_thread_runnable(data, &vec);
+        return_thread_runnable_with_obj(data, &vec, p);
       } else {
         // Again, special encoding for syntax
         make_c_opaque(opq, obj_char2obj(c));
-        return_thread_runnable(data, &opq);
+        return_thread_runnable_with_obj(data, &opq, p);
       }
     } else if (c == '"') {
       if (p->tok_end) _read_return_atom(data, cont, p);
@@ -6295,7 +7253,7 @@ void Cyc_io_read_token(void *data, object cont, object port)
           p->buf_idx += 3;
           p->col_num += 3;
         }
-        return_thread_runnable(data, boolean_t);
+        return_thread_runnable_with_obj(data, boolean_t, p);
       } else if (c == 'f') {
         if ((p->mem_buf_len - p->buf_idx) >= 4 &&
             p->mem_buf[p->buf_idx + 0] == 'a' &&
@@ -6305,7 +7263,7 @@ void Cyc_io_read_token(void *data, object cont, object port)
           p->buf_idx += 4;
           p->col_num += 4;
         }
-        return_thread_runnable(data, boolean_f);
+        return_thread_runnable_with_obj(data, boolean_f, p);
       } else if (c == '\\') {
         _read_character(data, p);
       } else if (c == 'e') {
@@ -6320,7 +7278,7 @@ void Cyc_io_read_token(void *data, object cont, object port)
         _read_number(data, p, 16, 1);
       } else if (c == '(') { // Vector
         make_empty_vector(vec);
-        return_thread_runnable(data, &vec);
+        return_thread_runnable_with_obj(data, &vec, p);
       } else if (c == 'u') { // Bytevector
         _read_next_char(data, cont, p); // Fill buffer
         c = p->mem_buf[p->buf_idx++];
@@ -6331,7 +7289,7 @@ void Cyc_io_read_token(void *data, object cont, object port)
           p->col_num++;
           if (c == '(') {
             make_empty_bytevector(vec);
-            return_thread_runnable(data, &vec);
+            return_thread_runnable_with_obj(data, &vec, p);
           } else {
             _read_error(data, p, "Unhandled input sequence");
           }
@@ -6348,7 +7306,7 @@ void Cyc_io_read_token(void *data, object cont, object port)
         vec.elements = (object *) alloca(sizeof(object) * vec.num_elements);
         vec.elements[0] = sym;
         vec.elements[1] = boolean_f;
-        return_thread_runnable(data, &vec);
+        return_thread_runnable_with_obj(data, &vec, p);
       } else {
         char buf[31];
         snprintf(buf, 30, "Unhandled input sequence %c", c);
@@ -6356,6 +7314,16 @@ void Cyc_io_read_token(void *data, object cont, object port)
       }
     } else if (c == '|' && !p->tok_end) {
       _read_literal_identifier(data, p);
+    } else if (c == '[' || c == '{') {
+      if (p->tok_end) _read_return_atom(data, cont, p);
+      // Special encoding so we can distinguish from chars such as #\(
+      make_c_opaque(opq, obj_char2obj('(')); // Cheap support for brackets
+      return_thread_runnable_with_obj(data, &opq, p);
+    } else if (c == ']' || c == '}') {
+      if (p->tok_end) _read_return_atom(data, cont, p);
+      // Special encoding so we can distinguish from chars such as #\(
+      make_c_opaque(opq, obj_char2obj(')')); // Cheap support for brackets
+      return_thread_runnable_with_obj(data, &opq, p);
     } else {
       // No special meaning, add char to current token (an atom)
       _read_add_to_tok_buf(p, c);
@@ -6364,3 +7332,209 @@ void Cyc_io_read_token(void *data, object cont, object port)
   }
 }
 
+////////////// UTF-8 Section //////////////
+
+// Copyright (c) 2008-2009 Bjoern Hoehrmann <bjoern@hoehrmann.de>
+// See http://bjoern.hoehrmann.de/utf-8/decoder/dfa/ for details.
+static const uint8_t utf8d[] = {
+  // The first part of the table maps bytes to character classes that
+  // to reduce the size of the transition table and create bitmasks.
+   0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+   0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+   0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+   0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+   1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,  9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,
+   7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,  7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
+   8,8,2,2,2,2,2,2,2,2,2,2,2,2,2,2,  2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,
+  10,3,3,3,3,3,3,3,3,3,3,3,3,4,3,3, 11,6,6,6,5,8,8,8,8,8,8,8,8,8,8,8,
+
+  // The second part is a transition table that maps a combination
+  // of a state of the automaton and a character class to a state.
+   0,12,24,36,60,96,84,12,12,12,48,72, 12,12,12,12,12,12,12,12,12,12,12,12,
+  12, 0,12,12,12,12,12, 0,12, 0,12,12, 12,24,12,12,12,12,12,24,12,24,12,12,
+  12,12,12,12,12,12,12,24,12,12,12,12, 12,24,12,12,12,12,12,12,12,24,12,12,
+  12,12,12,12,12,12,12,36,12,36,12,12, 12,36,12,12,12,12,12,36,12,36,12,12,
+  12,36,12,12,12,12,12,12,12,12,12,12, 
+};
+
+/**
+ * @brief Decode the next byte of a codepoint.
+ *        Based on example code from Bjoern Hoehrmann.
+ * @param state Out parameter, the state of the decoding
+ * @param codep Out parameter, contains the codepoint
+ * @param byte Byte to examine
+ * @return The current state: `CYC_UTF8_ACCEPT` if successful otherwise `CYC_UTF8_REJECT`.
+ */
+static uint32_t Cyc_utf8_decode(uint32_t* state, uint32_t* codep, uint32_t byte) {
+  uint32_t type = utf8d[byte];
+
+  *codep = (*state != CYC_UTF8_ACCEPT) ?
+    (byte & 0x3fu) | (*codep << 6) :
+    (0xff >> type) & (byte);
+
+  *state = utf8d[256 + *state + type];
+  return *state;
+}
+// END Bjoern Hoehrmann
+
+/**
+ * @brief Count the number of code points in a string.
+ *        Based on example code from Bjoern Hoehrmann.
+ * @param s String to examine
+ * @return The number of codepoints found, or -1 if there was an error.
+ */
+int Cyc_utf8_count_code_points(uint8_t* s) {
+  uint32_t codepoint;
+  uint32_t state = 0;
+  int count;
+
+  for (count = 0; *s; ++s)
+    if (!Cyc_utf8_decode(&state, &codepoint, *s))
+      count += 1;
+
+  if (state != CYC_UTF8_ACCEPT)
+    return -1;
+  return count;
+}
+
+/**
+ * @brief Count the number of code points and bytes in a string.
+ * @param s String to examine
+ * @param codepoint Out parameter, set to the codepoint.
+ * @param cpts Out parameter, set to the number of code points
+ * @param bytes Out parameter, set to the number of bytes
+ * @return Returns `CYC_UTF8_ACCEPT`  on success, otherwise `CYC_UTF8_REJECT`.
+ */
+static int Cyc_utf8_count_code_points_and_bytes(uint8_t* s, char_type *codepoint, int *cpts, int *bytes) {
+  uint32_t state = 0;
+  *cpts = 0;
+  *bytes = 0;
+  for (; *s; ++s){
+    *bytes += 1;
+    if (!Cyc_utf8_decode(&state, codepoint, *s))
+      *cpts += 1;
+  }
+
+  if (state != CYC_UTF8_ACCEPT)
+    return state;
+  return 0;
+}
+
+// TODO: index into X codepoint in a string 
+
+/**
+ * @brief
+ * Use this when validating from a stream, as it may be that the stream stopped
+ * in the middle of a codepoint, hence state passed in as an arg, so it can be
+ * tested in a loop and also after the loop has finished.
+ *
+ * From https://stackoverflow.com/a/22135005/101258
+ */
+uint32_t Cyc_utf8_validate_stream(uint32_t *state, char *str, size_t len) {
+   size_t i;
+   uint32_t type;
+
+    for (i = 0; i < len; i++) {
+        // We don't care about the codepoint, so this is
+        // a simplified version of the decode function.
+        type = utf8d[(uint8_t)str[i]];
+        *state = utf8d[256 + (*state) + type];
+
+        if (*state == CYC_UTF8_REJECT)
+            break;
+    }
+
+    return *state;
+}
+
+/**
+ * @brief Simplified version of Cyc_utf8_validate_stream that must always be called with a complete string buffer.
+ */
+uint32_t Cyc_utf8_validate(char *str, size_t len) {
+   size_t i;
+   uint32_t state = CYC_UTF8_ACCEPT, type;
+
+    for (i = 0; i < len; i++) {
+        // We don't care about the codepoint, so this is
+        // a simplified version of the decode function.
+        type = utf8d[(uint8_t)str[i]];
+        state = utf8d[256 + (state) + type];
+
+        if (state == CYC_UTF8_REJECT)
+            break;
+    }
+
+    return state;
+}
+
+//int uint32_num_bytes(uint32_t x) {
+//  // TODO: could compute log(val) / log(256)
+//  if (x < 0x100) return 1;
+//  if (x < 0x10000) return 2;
+//  if (x < 0x1000000) return 3;
+//  return 4;
+//}
+
+/**
+ * This function takes one or more 32-bit chars and encodes them 
+ * as an array of UTF-8 bytes.
+ * FROM: https://www.cprogramming.com/tutorial/utf8.c
+ *
+ * @param dest    Destination byte buffer
+ * @param sz      size of dest buffer in bytes
+ * @param src     Buffer of source data, in 32-bit characters
+ * @param srcsz   number of source characters, or -1 if 0-terminated
+ *
+ * @return Number of characters converted
+ *
+ * dest will only be '\0'-terminated if there is enough space. this is
+ * for consistency; imagine there are 2 bytes of space left, but the next
+ * character requires 3 bytes. in this case we could NUL-terminate, but in
+ * general we can't when there's insufficient space. therefore this function
+ * only NUL-terminates if all the characters fit, and there's space for
+ * the NUL as well.
+ * the destination string will never be bigger than the source string.
+ */
+int Cyc_utf8_encode(char *dest, int sz, uint32_t *src, int srcsz)
+{
+    u_int32_t ch;
+    int i = 0;
+    char *dest_end = dest + sz;
+
+    while (srcsz<0 ? src[i]!=0 : i < srcsz) {
+        ch = src[i];
+        if (ch < 0x80) {
+            if (dest >= dest_end)
+                return i;
+            *dest++ = (char)ch;
+        }
+        else if (ch < 0x800) {
+            if (dest >= dest_end-1)
+                return i;
+            *dest++ = (ch>>6) | 0xC0;
+            *dest++ = (ch & 0x3F) | 0x80;
+        }
+        else if (ch < 0x10000) {
+            if (dest >= dest_end-2)
+                return i;
+            *dest++ = (ch>>12) | 0xE0;
+            *dest++ = ((ch>>6) & 0x3F) | 0x80;
+            *dest++ = (ch & 0x3F) | 0x80;
+        }
+        else if (ch < 0x110000) {
+            if (dest >= dest_end-3)
+                return i;
+            *dest++ = (ch>>18) | 0xF0;
+            *dest++ = ((ch>>12) & 0x3F) | 0x80;
+            *dest++ = ((ch>>6) & 0x3F) | 0x80;
+            *dest++ = (ch & 0x3F) | 0x80;
+        }
+        i++;
+    }
+    if (dest < dest_end)
+        *dest = '\0';
+    return i;
+}
+
+
+////////////// END UTF-8 Section //////////////

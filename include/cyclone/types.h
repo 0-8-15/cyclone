@@ -10,6 +10,7 @@
 #define CYCLONE_TYPES_H
 
 #include <math.h>
+#include <complex.h>
 #include <setjmp.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -55,6 +56,7 @@ enum object_tag {
       , string_tag              // 18
       , symbol_tag              // 19
       , vector_tag              // 20
+      , complex_num_tag         // 21
 };
 
 #define type_is_pair_prim(clo) \
@@ -100,7 +102,7 @@ typedef unsigned char tag_type;
 #define INITIAL_HEAP_SIZE (3 * 1024 * 1024)     
 
 /** Normal size of a heap page */
-#define HEAP_SIZE (32 * 1024 * 1024)    
+#define HEAP_SIZE (8 * 1024 * 1024)    
 
 // End heap page size parameters
 ////////////////////////////////
@@ -109,7 +111,10 @@ typedef unsigned char tag_type;
 // Major GC tuning parameters
 
 /** Start GC cycle if % heap space free below this percentage */
-#define GC_COLLECTION_THRESHOLD 0.05
+#define GC_COLLECTION_THRESHOLD 0.0125 //0.05
+
+/** Start GC cycle if fewer than this many heap pages are unswept */
+#define GC_COLLECT_UNDER_UNSWEPT_HEAP_COUNT 3
 
 /** After major GC, grow the heap so at least this percentage is free */
 #define GC_FREE_THRESHOLD 0.40
@@ -168,6 +173,15 @@ typedef enum {
   , HEAP_HUGE    // Huge objects, 1 per page
 } gc_heap_type;
 
+/** The first heap type that is not fixed-size */
+// TODO: disable this for now
+//#define LAST_FIXED_SIZE_HEAP_TYPE -1
+#if INTPTR_MAX == INT64_MAX
+#define LAST_FIXED_SIZE_HEAP_TYPE HEAP_96
+#else
+#define LAST_FIXED_SIZE_HEAP_TYPE HEAP_64
+#endif
+
 /** The number of `gc_heap_type`'s */
 #define NUM_HEAP_TYPES (HEAP_HUGE + 1)
 
@@ -190,6 +204,13 @@ struct gc_heap_t {
   unsigned int chunk_size;      // 0 for any size, other and heap will only alloc chunks of that size
   unsigned int max_size;
   unsigned int ttl; // Keep empty page alive this many times before freeing
+  unsigned int remaining;
+  unsigned block_size;
+  char *data_end;
+  // Lazy-sweep related data
+  unsigned int free_size; // Amount of heap data that is free
+  unsigned char is_full; // Determine if the heap is full
+  unsigned char is_unswept;
   //
   gc_heap *next_free;
   unsigned int last_alloc_size;
@@ -198,6 +219,8 @@ struct gc_heap_t {
   //
   gc_free_list *free_list;
   gc_heap *next;                // TBD, linked list is not very efficient, but easy to work with as a start
+  //int num_children;
+  int num_unswept_children;
   char *data;
 };
 
@@ -214,7 +237,7 @@ struct gc_heap_root_t {
  */
 typedef struct gc_header_type_t gc_header_type;
 struct gc_header_type_t {
-  unsigned char mark;           // mark bits (only need 2)
+  unsigned char mark;           // mark bits 
   unsigned char grayed;         // stack object to be grayed when moved to heap
 };
 
@@ -243,6 +266,14 @@ typedef enum { STAGE_CLEAR_OR_MARKING, STAGE_TRACING
 
 /** Unallocated memory */
 #define gc_color_blue 2         
+
+/** Mark buffers */
+typedef struct mark_buffer_t mark_buffer;
+struct mark_buffer_t {
+  void **buf;
+  unsigned buf_len;
+  mark_buffer *next;
+};
 
 /** Threading */
 typedef enum { CYC_THREAD_STATE_NEW, CYC_THREAD_STATE_RUNNABLE,
@@ -280,20 +311,27 @@ struct gc_thread_data_t {
   object *gc_args;
   short gc_num_args;
   // Data needed for heap GC
-  int gc_alloc_color;
+  unsigned char gc_alloc_color;
+  unsigned char gc_trace_color;
+  uint8_t gc_done_tracing;
   int gc_status;
   int last_write;
   int last_read;
+  // Need this because minor GC may still be moving objects to the heap and
+  // if we try to trace before minor GC is done, some of the objects may be
+  // missed. So we "pend" them until minor GC is done and we know everything
+  // is on the heap.
   int pending_writes;
-  void **mark_buffer;
+  mark_buffer *mark_buffer;
   int mark_buffer_len;
   pthread_mutex_t lock;
-  pthread_mutex_t heap_lock;
+  //pthread_mutex_t heap_lock;
   pthread_t thread_id;
   gc_heap_root *heap;
   uintptr_t *cached_heap_free_sizes;
   uintptr_t *cached_heap_total_sizes;
   int heap_num_huge_allocations;
+  int num_minor_gcs;
   // Data needed for call history
   char **stack_traces;
   int stack_trace_idx;
@@ -315,11 +353,13 @@ gc_heap *gc_heap_create(int heap_type, size_t size, size_t max_size,
 gc_heap *gc_heap_free(gc_heap *page, gc_heap *prev_page);
 void gc_heap_merge(gc_heap *hdest, gc_heap *hsrc);
 void gc_merge_all_heaps(gc_thread_data *dest, gc_thread_data *src);
+int gc_is_heap_empty(gc_heap *h);
 void gc_print_stats(gc_heap * h);
 int gc_grow_heap(gc_heap * h, int heap_type, size_t size, size_t chunk_size, gc_thread_data *thd);
 char *gc_copy_obj(object hp, char *obj, gc_thread_data * thd);
 void *gc_try_alloc(gc_heap * h, int heap_type, size_t size, char *obj,
                    gc_thread_data * thd);
+void *gc_try_alloc_slow(gc_heap *h_passed, gc_heap *h, int heap_type, size_t size, char *obj, gc_thread_data *thd);
 void *gc_alloc(gc_heap_root * h, size_t size, char *obj, gc_thread_data * thd,
                int *heap_grown);
 void *gc_alloc_bignum(gc_thread_data *data);
@@ -330,6 +370,7 @@ void gc_heap_create_rest(gc_heap *h, gc_thread_data *thd);
 int gc_grow_heap_rest(gc_heap * h, int heap_type, size_t size, size_t chunk_size, gc_thread_data *thd);
 void *gc_try_alloc_rest(gc_heap * h, int heap_type, size_t size, size_t chunk_size, char *obj, gc_thread_data * thd);
 void *gc_alloc_rest(gc_heap_root * hrt, size_t size, char *obj, gc_thread_data * thd, int *heap_grown);
+void gc_init_fixed_size_free_list(gc_heap *h);
 
 //size_t gc_heap_total_size(gc_heap * h);
 //size_t gc_heap_total_free_size(gc_heap *h);
@@ -337,9 +378,9 @@ void *gc_alloc_rest(gc_heap_root * hrt, size_t size, char *obj, gc_thread_data *
 //void gc_mark(gc_heap *h, object obj);
 void gc_request_mark_globals(void);
 void gc_mark_globals(object globals, object global_table);
-size_t gc_sweep(gc_heap * h, int heap_type, size_t * sum_freed_ptr, gc_thread_data *thd);
+//size_t gc_sweep(gc_heap * h, int heap_type, size_t * sum_freed_ptr, gc_thread_data *thd);
+gc_heap *gc_sweep(gc_heap * h, int heap_type, gc_thread_data *thd);
 void gc_thr_grow_move_buffer(gc_thread_data * d);
-void gc_thr_add_to_move_buffer(gc_thread_data * d, int *alloci, object obj);
 void gc_thread_data_init(gc_thread_data * thd, int mut_num, char *stack_base,
                          long stack_size);
 void gc_thread_data_free(gc_thread_data * thd);
@@ -356,11 +397,20 @@ void gc_post_handshake(gc_status_type s);
 void gc_wait_handshake();
 void gc_start_collector();
 void gc_mutator_thread_blocked(gc_thread_data * thd, object cont);
-void gc_mutator_thread_runnable(gc_thread_data * thd, object result);
+void gc_mutator_thread_runnable(gc_thread_data * thd, object result, object maybe_copied);
 #define set_thread_blocked(d, c) \
   gc_mutator_thread_blocked(((gc_thread_data *)d), (c))
+/**
+ * @brief Return from a blocked thread
+ */
 #define return_thread_runnable(d, r) \
-  gc_mutator_thread_runnable(((gc_thread_data *)d), (r))
+  gc_mutator_thread_runnable(((gc_thread_data *)d), (r), NULL)
+/**
+ * @brief Return from a blocked thread with an object that may have been copied.
+ *        If the object was copied we need to check and may need to copy it again.
+ */
+#define return_thread_runnable_with_obj(d, r, maybe_copied) \
+  gc_mutator_thread_runnable(((gc_thread_data *)d), (r), maybe_copied)
 /*
 //#define do_with_blocked_thread(data, cont, result, body) \
 //  set_thread_blocked((data), (cont)); \
@@ -466,6 +516,12 @@ void clear_mutations(void *data);
 #define CYC_FIXNUM_MIN -1073741824
 
 /**
+ * Explicit character type now that we are using UTF-8.
+ * Chars are still value types though
+ */
+typedef uint32_t char_type;
+
+/**
  * Determine if an object is an integer.
  */
 #define obj_is_int(x)  ((unsigned long)(x) & (unsigned long)1)
@@ -473,11 +529,13 @@ void clear_mutations(void *data);
 /**
  * Convert from an object to an integer.
  */
-#define obj_obj2int(x) ((long)(x)>>1)
+//#define obj_obj2int(n)   (((long)((ulong)(n) & ~1))/(long)(1uL<<1))
+#define obj_obj2int(x) ((long)((uintptr_t)x)>>1)
 
 /**
  * Convert from an integer to an object.
  */
+//#define obj_int2obj(n) ((void *) ((((long)(n))*(long)(1uL<<1)) | 1))
 #define obj_int2obj(c) ((void *)((((long)c)<<1) | 1))
 
 /**
@@ -488,12 +546,12 @@ void clear_mutations(void *data);
 /**
  * Convert from an object to a char.
  */
-#define obj_obj2char(x) (char)((long)(x)>>2)
+#define obj_obj2char(x) (char_type)((uintptr_t)(x)>>2)
 
 /**
  * Convert from a char to an object.
  */
-#define obj_char2obj(c) ((void *)((((unsigned long)c)<<2) | 2))
+#define obj_char2obj(c) ((void *)((((uintptr_t)c)<<2) | 2))
 
 /**
  * Is the given object a value type?
@@ -503,7 +561,7 @@ void clear_mutations(void *data);
 /**
  * Is the given object an object (non-immediate) type?
  */
-#define is_object_type(x) (x && !is_value_type(x))
+#define is_object_type(x) ((x != NULL) && !is_value_type(x))
 
 /**@}*/
 
@@ -618,6 +676,8 @@ typedef boolean_type *boolean;
 
 #define boolean_desc(x) (((boolean_type *) x)->desc)
 
+#define make_boolean(x) (x ? boolean_t : boolean_f)
+
 /**
  * @brief Symbols are similar to strings, but only one instance of each
  * unique symbol is created, so comparisons are O(1).
@@ -671,6 +731,37 @@ typedef struct {
   bignum_type *p = gc_alloc_bignum((gc_thread_data *)data);
 
 /**
+ * @brief Complex number
+ */
+typedef struct {
+  gc_header_type hdr;
+  tag_type tag;
+  double complex value;
+} complex_num_type;
+
+/** Create a new complex number in the nursery */
+#define make_complex_num(n,r,i) \
+  complex_num_type n; \
+  n.hdr.mark = gc_color_red; \
+  n.hdr.grayed = 0; \
+  n.tag = complex_num_tag; \
+  n.value = (r + (i * I));
+
+#define alloca_complex_num(n,r,i) \
+  complex_num_type *n = alloca(sizeof(complex_num_type)); \
+  n->hdr.mark = gc_color_red; \
+  n->hdr.grayed = 0; \
+  n->tag = complex_num_tag; \
+  n->value = (r + (i * I));
+
+/** Assign given complex value to the given complex number object pointer */
+#define assign_complex_num(pobj,v) \
+  ((complex_num_type *)pobj)->hdr.mark = gc_color_red; \
+  ((complex_num_type *)pobj)->hdr.grayed = 0; \
+  ((complex_num_type *)pobj)->tag = complex_num_tag; \
+  complex_num_value(pobj) = v;
+
+/**
  * @brief Double-precision floating point type, also known as a flonum.
  */
 typedef struct {
@@ -687,6 +778,13 @@ typedef struct {
   n.tag = double_tag; \
   n.value = v;
 
+#define alloca_double(n,v) \
+  double_type *n = alloca(sizeof(double_type)); \
+  n->hdr.mark = gc_color_red; \
+  n->hdr.grayed = 0; \
+  n->tag = double_tag; \
+  n->value = v;
+
 /** Assign given double value to the given double object pointer */
 #define assign_double(pobj,v) \
   ((double_type *)pobj)->hdr.mark = gc_color_red; \
@@ -702,6 +800,9 @@ typedef struct {
 
 /** Access a bignum's `mp_int` directly */
 #define bignum_value(x) (((bignum_type *) x)->bn)
+
+/** Access the complex number directly */
+#define complex_num_value(x) (((complex_num_type *) x)->value)
 
 /**
  * This enumeration complements the comparison types from LibTomMath,
@@ -721,9 +822,13 @@ typedef enum {
 typedef struct {
   gc_header_type hdr;
   tag_type tag;
+  int num_cp;
   int len;
   char *str;
 } string_type;
+
+// TODO: below macros are obsolete, need new ones that populate num_cp and
+// raise an error if an invalid UTF-8 char is detected
 
 /** Create a new string in the nursery */
 #define make_string(cs, s) string_type cs; \
@@ -731,6 +836,7 @@ typedef struct {
   cs.hdr.mark = gc_color_red; \
   cs.hdr.grayed = 0; \
   cs.tag = string_tag; \
+  cs.num_cp = len; \
   cs.len = len; \
   cs.str = alloca(sizeof(char) * (len + 1)); \
   memcpy(cs.str, s, len + 1);}
@@ -744,6 +850,7 @@ typedef struct {
   cs.hdr.mark = gc_color_red; \
   cs.hdr.grayed = 0; \
   cs.tag = string_tag; cs.len = len; \
+  cs.num_cp = len; \
   cs.str = alloca(sizeof(char) * (len + 1)); \
   memcpy(cs.str, s, len); \
   cs.str[len] = '\0';}
@@ -755,9 +862,100 @@ typedef struct {
 #define make_string_noalloc(cs, s, length) string_type cs; \
 { cs.hdr.mark = gc_color_red; cs.hdr.grayed = 0; \
   cs.tag = string_tag; cs.len = length; \
+  cs.num_cp = length; \
   cs.str = s; }
 
-/** Get the length of a string */
+/** Create a new string in the nursery */
+#define make_utf8_string(data, cs, s) string_type cs; \
+{ int len = strlen(s); \
+  cs.hdr.mark = gc_color_red; \
+  cs.hdr.grayed = 0; \
+  cs.tag = string_tag; \
+  cs.num_cp = Cyc_utf8_count_code_points((uint8_t *)s); \
+  if (cs.num_cp < 0) { \
+    Cyc_rt_raise_msg(data, "Invalid UTF-8 characters in string"); \
+  } \
+  cs.len = len; \
+  cs.str = alloca(sizeof(char) * (len + 1)); \
+  memcpy(cs.str, s, len + 1);}
+
+/** 
+ * Create a new string with the given length 
+ * (so it does not need to be computed) 
+ */
+#define make_utf8_string_with_len(cs, s, length, num_code_points) string_type cs;  \
+{ int len = length; \
+  cs.hdr.mark = gc_color_red; \
+  cs.hdr.grayed = 0; \
+  cs.tag = string_tag; cs.len = len; \
+  cs.num_cp = num_code_points; \
+  cs.str = alloca(sizeof(char) * (len + 1)); \
+  memcpy(cs.str, s, len); \
+  cs.str[len] = '\0';}
+
+/**
+ * Create a string object using the given C string and length.
+ * No allocation is done for the given C string.
+ */
+#define make_utf8_string_noalloc(cs, s, length) string_type cs; \
+{ cs.hdr.mark = gc_color_red; cs.hdr.grayed = 0; \
+  cs.tag = string_tag; cs.len = length; \
+  cs.num_cp = length; \
+  cs.str = s; }
+
+/**
+ * Allocate a new string, either on the stack or heap depending upon size
+ */
+#define alloc_string(_data, _s, _len, _num_cp) \
+  if (_len >= MAX_STACK_OBJ) { \
+    int heap_grown; \
+    _s = gc_alloc(((gc_thread_data *)data)->heap,  \
+                 sizeof(string_type) + _len + 1, \
+                 boolean_f, /* OK to populate manually over here */ \
+                 (gc_thread_data *)data,  \
+                 &heap_grown); \
+    ((string_type *) _s)->hdr.mark = ((gc_thread_data *)data)->gc_alloc_color; \
+    ((string_type *) _s)->hdr.grayed = 0; \
+    ((string_type *) _s)->tag = string_tag; \
+    ((string_type *) _s)->len = _len; \
+    ((string_type *) _s)->num_cp = _num_cp; \
+    ((string_type *) _s)->str = (((char *)_s) + sizeof(string_type)); \
+  } else { \
+    _s = alloca(sizeof(string_type)); \
+    ((string_type *)_s)->hdr.mark = gc_color_red;  \
+    ((string_type *)_s)->hdr.grayed = 0; \
+    ((string_type *)_s)->tag = string_tag;  \
+    ((string_type *)_s)->len = _len; \
+    ((string_type *)_s)->num_cp = _num_cp; \
+    ((string_type *)_s)->str = alloca(sizeof(char) * (_len + 1)); \
+  }
+
+#define alloc_bytevector(_data, _bv, _len) \
+  if (_len >= MAX_STACK_OBJ) { \
+    int heap_grown; \
+    _bv = gc_alloc(((gc_thread_data *)data)->heap, \
+                  sizeof(bytevector_type) + _len, \
+                  boolean_f, /* OK to populate manually over here */ \
+                  (gc_thread_data *)data, \
+                  &heap_grown); \
+    ((bytevector) _bv)->hdr.mark = ((gc_thread_data *)data)->gc_alloc_color; \
+    ((bytevector) _bv)->hdr.grayed = 0; \
+    ((bytevector) _bv)->tag = bytevector_tag; \
+    ((bytevector) _bv)->len = _len; \
+    ((bytevector) _bv)->data = (char *)(((char *)_bv) + sizeof(bytevector_type)); \
+  } else { \
+    _bv = alloca(sizeof(bytevector_type)); \
+    ((bytevector) _bv)->hdr.mark = gc_color_red; \
+    ((bytevector) _bv)->hdr.grayed = 0; \
+    ((bytevector) _bv)->tag = bytevector_tag; \
+    ((bytevector) _bv)->len = _len; \
+    ((bytevector) _bv)->data = alloca(sizeof(char) * _len); \
+  }
+
+/** Get the length of a string, in characters (code points) */
+#define string_num_cp(x) (((string_type *) x)->num_cp)
+
+/** Get the length of a string, in bytes */
 #define string_len(x) (((string_type *) x)->len)
 
 /** Get a string object's C string */
@@ -776,6 +974,7 @@ typedef struct {
 typedef struct {
   gc_header_type hdr;
   tag_type tag;
+  void *unused; // Protect against forwarding pointer, ideally would not be needed.
   FILE *fp;
   int mode;
   unsigned char flags;
@@ -849,6 +1048,10 @@ typedef struct {
 } vector_type;
 typedef vector_type *vector;
 
+typedef struct { vector_type v; object arr[2]; } vector_2_type;
+typedef struct { vector_type v; object arr[3]; } vector_3_type;
+typedef struct { vector_type v; object arr[4]; } vector_4_type;
+
 /** Create a new vector in the nursery */
 #define make_empty_vector(v) \
   vector_type v; \
@@ -857,6 +1060,14 @@ typedef vector_type *vector;
   v.tag = vector_tag; \
   v.num_elements = 0; \
   v.elements = NULL;
+
+#define alloca_empty_vector(v) \
+  vector_type *v = alloca(sizeof(vector_type)); \
+  v->hdr.mark = gc_color_red; \
+  v->hdr.grayed = 0; \
+  v->tag = vector_tag; \
+  v->num_elements = 0; \
+  v->elements = NULL;
 
 /**
  * @brief Bytevector type 
@@ -880,6 +1091,14 @@ typedef bytevector_type *bytevector;
   v.tag = bytevector_tag; \
   v.len = 0; \
   v.data = NULL;
+
+#define alloca_empty_bytevector(v) \
+  bytevector_type *v = alloca(sizeof(bytevector_type)); \
+  v->hdr.mark = gc_color_red; \
+  v->hdr.grayed = 0; \
+  v->tag = bytevector_tag; \
+  v->len = 0; \
+  v->data = NULL;
 
 /**
  * @brief The pair (cons) type.
@@ -909,6 +1128,14 @@ typedef pair_type *pair;
   n.pair_car = a; \
   n.pair_cdr = d;
 
+#define alloca_pair(n,a,d) \
+  pair_type *n = alloca(sizeof(pair_type)); \
+  n->hdr.mark = gc_color_red; \
+  n->hdr.grayed = 0; \
+  n->tag = pair_tag; \
+  n->pair_car = a; \
+  n->pair_cdr = d;
+
 #define set_pair(n,a,d) \
   n->hdr.mark = gc_color_red; \
   n->hdr.grayed = 0; \
@@ -916,11 +1143,26 @@ typedef pair_type *pair;
   n->pair_car = a; \
   n->pair_cdr = d;
 
+#define set_pair_as_expr(n,a,d) \
+ (((pair)(n))->hdr.mark = gc_color_red, \
+  ((pair)(n))->hdr.grayed = 0, \
+  ((pair)(n))->tag = pair_tag, \
+  ((pair)(n))->pair_car = a, \
+  ((pair)(n))->pair_cdr = d, \
+  (n))
+
+//typedef list_1_type pair_type;
+typedef struct { pair_type a; pair_type b; } list_2_type;
+typedef struct { pair_type a; pair_type b; pair_type c;} list_3_type;
+typedef struct { pair_type a; pair_type b; pair_type c; pair_type d;} list_4_type;
+
 /**
  * Create a pair with a single value. 
  * This is useful to create an object that can be modified.
  */
-#define make_cell(n,a) make_pair(n,a,NULL);
+#define make_cell(n,a) make_pair(n,a,NULL)
+#define alloca_cell(n,a) alloca_pair(n,a,NULL)
+#define set_cell_as_expr(n,a) set_pair_as_expr(n,a,NULL)
 
 /**
  * \defgroup objects_unsafe_cxr Unsafe pair access macros
@@ -1109,11 +1351,13 @@ typedef union {
   integer_type integer_t;
   double_type double_t;
   bignum_type bignum_t;
+  complex_num_type complex_num_t;
 } common_type;
 
-#define return_copy(ptr, obj) \
+#define return_copy(ptr, o) \
 { \
   tag_type t; \
+  object obj = o; \
   if (!is_object_type(obj)) \
     return obj; \
   t = type_of(obj); \
@@ -1137,7 +1381,7 @@ void **vpbuffer_add(void **buf, int *len, int i, void *obj);
 void vpbuffer_free(void **buf);
 
 /* Bignum utility functions */
-double mp_get_double(mp_int *a);
+double mp_get_double(const mp_int *a);
 int Cyc_bignum_cmp(bn_cmp_type type, object x, int tx, object y, int ty);
 void Cyc_int2bignum(int n, mp_int *bn);
 

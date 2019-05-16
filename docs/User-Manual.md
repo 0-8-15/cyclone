@@ -21,7 +21,7 @@
 
 
 # Introduction
-Cyclone is an experimental Scheme-to-C compiler that uses a variant of the [Cheney on the MTA](http://www.pipeline.com/~hbaker1/CheneyMTA.html) technique to implement full tail recursion, continuations, generational garbage collection, and native threads.
+Cyclone is an experimental Scheme-to-C compiler that uses a variant of the [Cheney on the MTA](https://github.com/justinethier/cyclone/raw/master/docs/research-papers/CheneyMTA.pdf) technique to implement full tail recursion, continuations, generational garbage collection, and native threads.
 
 Cyclone works by converting a Scheme program to continuation passing style and compiling each continuation to a C function. At runtime these functions never return and are allowed to fill up the stack until they trigger a minor garbage collection. Live stack objects are then copied to the heap and `longjmp` is used to return to the beginning of the stack. This is the same technique proposed by Henry Baker (Cheney on the MTA) and implemented first by CHICKEN Scheme. The difference is that our compiler allows multiple native threads, each with their own stack. A tracing garbage collector is used to manage the second-generation heap and perform major collections without "stopping the world".
 
@@ -40,10 +40,10 @@ The following packages are required:
 - [LibTomMath](https://github.com/libtom/libtommath)
 - [Concurrency Kit](http://concurrencykit.org/)
 
-  NOTE: The best way to install `libck` is via a package manager such as `apt-get`. But if a package is not available for this library it can also be built from source. Just replace `0.5.2` below with the latest version available from their website:
+  NOTE: The best way to install `libck` is via a package manager such as `apt-get`. But if a package is not available for this library it can also be built from source. Just replace `0.6.0` below with the latest version available from their website:
     
-        wget http://concurrencykit.org/releases/ck-0.5.2.tar.gz
-        tar xfz ck-0.5.2.tar.gz ; cd ck-0.5.2 ; ./configure PREFIX=/usr && make all && sudo make install
+        wget http://concurrencykit.org/releases/ck-0.6.0.tar.gz
+        tar xfz ck-0.6.0.tar.gz ; cd ck-0.6.0 ; ./configure PREFIX=/usr && make all && sudo make install
         sudo ldconfig
 
 On a Debian variant such as Ubuntu the necessary packages may be installed via the command:
@@ -58,7 +58,7 @@ The following command can be used to install dependencies on Fedora, though `lib
 
 Cyclone cannot be built directly on a system that does not have Cyclone binaries installed because the compiler is [self-hosting](https://en.wikipedia.org/wiki/Self-hosting). The easiest way to install Cyclone binaries is to build from source using [cyclone-bootstrap](https://github.com/justinethier/cyclone-bootstrap):
 
-    $ git clone git@github.com:justinethier/cyclone-bootstrap.git
+    $ git clone https://github.com/justinethier/cyclone-bootstrap.git
     $ cd cyclone-bootstrap
     $ ./install.sh
 
@@ -224,7 +224,7 @@ Cyclone is available under the [MIT license](http://www.opensource.org/licenses/
 
 # References and Further Reading
 
-- [CONS Should Not CONS Its Arguments, Part II: Cheney on the M.T.A.](http://www.pipeline.com/~hbaker1/CheneyMTA.html), by Henry Baker
+- [CONS Should Not CONS Its Arguments, Part II: Cheney on the M.T.A.](https://github.com/justinethier/cyclone/raw/master/docs/research-papers/CheneyMTA.pdf), by Henry Baker
 - [CHICKEN Scheme](http://www.call-cc.org/)
 - [Chibi Scheme](https://github.com/ashinn/chibi-scheme)
 - [Compiling Scheme to C with closure conversion](http://matt.might.net/articles/compiling-scheme-to-c/), by Matt Might

@@ -11,12 +11,17 @@
           (scheme char))
   (export
     ;; Code analysis
+    define-syntax?
+    let-syntax?
+    letrec-syntax?
     tagged-list?
     if?
     if-syntax?
     begin?
     lambda?
     pair->list 
+    define-lambda? 
+    define->lambda 
     formals->list
     lambda-formals->list
     lambda-varargs?
@@ -120,7 +125,15 @@
     (or 
       (= (length exp) 3)
       (= (length exp) 4))))
-       
+
+(define (define-syntax? exp)
+  (tagged-list? 'define-syntax exp))
+
+(define (let-syntax? exp)
+  (tagged-list? 'let-syntax exp))
+
+(define (letrec-syntax? exp)
+  (tagged-list? 'letrec-syntax exp))
 
 ; begin? : exp -> boolean
 (define (begin? exp) 
@@ -156,6 +169,7 @@
 (define (const? exp)
   (or (integer? exp)
       (real? exp)
+      (complex? exp)
       (string? exp)
       (vector? exp)
       (bytevector? exp)
@@ -581,14 +595,16 @@
 
 ;;; Explicit renaming macros
 
-(define (Cyc-er-rename use-env mac-env)
+(define (Cyc-er-rename use-env mac-env binding-lis)
   ((lambda (renames)
      (lambda (identifier)
 ;(Cyc-write `(ER rename ,identifier) (current-output-port))
 ;(Cyc-display "\n"  (current-output-port))
-       ((lambda (cell)
-          (if cell
-              (cdr cell)
+       ((lambda (binding-cell cell)
+          (cond
+           (binding-cell (cdr binding-cell))
+           (cell (cdr cell))
+           (else
               ((lambda (name)
                  (set! renames (cons (cons identifier name) renames))
                  name)
@@ -599,6 +615,9 @@
                    ((tagged-list? 'macro val)
                     (let ((renamed (gensym identifier)))
                       (env:define-variable! renamed val mac-env)
+                      ;; Also update rename over here so it is available for 
+                      ;; use later on by compare
+                      (env:define-variable! renamed identifier use-env)
                       renamed))
                    ((eq? val 'not-defined)
                      ;; Unrenamed variable identifier
@@ -621,7 +640,8 @@
                ; forms other than symbols, if that is done.
                ;
                ;(make-syntactic-closure mac-env '() identifier)
-              )))
+              ))))
+        (assq identifier binding-lis)
         (assq identifier renames))
        ))
    ;; TODO: For now, do not allow renaming of special form symbols to 
@@ -629,6 +649,8 @@
    '(
      (define . define)
      (define-syntax . define-syntax)
+     (let-syntax . let-syntax)
+     (letrec-syntax . letrec-syntax)
      (define-c . define-c)
      (if . if)
      (lambda . lambda)

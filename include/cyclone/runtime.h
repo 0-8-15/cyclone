@@ -70,19 +70,19 @@ void gc_init_heap(long heap_size);
   if ((boolean_f == fnc_test(data, obj))) Cyc_invalid_type_error(data, tag, obj); }
 
 #define Cyc_check_pair_or_null(d,obj) { if (obj != NULL) { Cyc_check_pair(d,obj); }}
-#define Cyc_check_pair(d,obj) Cyc_check_type(d,Cyc_is_pair, pair_tag, obj);
-#define Cyc_check_proc(d,obj) Cyc_check_type2(d,Cyc_is_procedure, closureN_tag, obj);
-#define Cyc_check_num(d,obj) Cyc_check_type(d,Cyc_is_number, integer_tag, obj);
-#define Cyc_check_fixnum(d,obj) Cyc_check_type(d,Cyc_is_fixnum, integer_tag, obj);
-#define Cyc_check_int(d,obj) Cyc_check_type(d,Cyc_is_integer, integer_tag, obj);
-#define Cyc_check_str(d,obj) Cyc_check_type(d,Cyc_is_string, string_tag, obj);
-#define Cyc_check_sym(d,obj) Cyc_check_type(d,Cyc_is_symbol, symbol_tag, obj);
-#define Cyc_check_vec(d,obj) Cyc_check_type(d,Cyc_is_vector, vector_tag, obj);
-#define Cyc_check_bvec(d,obj) Cyc_check_type(d,Cyc_is_bytevector, bytevector_tag, obj);
-#define Cyc_check_port(d,obj) Cyc_check_type(d,Cyc_is_port, port_tag, obj);
-#define Cyc_check_mutex(d,obj) Cyc_check_type(d,Cyc_is_mutex, mutex_tag, obj);
-#define Cyc_check_cond_var(d,obj) Cyc_check_type(d,Cyc_is_cond_var, cond_var_tag, obj);
-#define Cyc_check_opaque(d,obj) Cyc_check_type(d,Cyc_is_opaque, c_opaque_tag, obj);
+#define Cyc_check_pair(d,obj) Cyc_check_type(d,Cyc_is_pair, pair_tag, obj)
+#define Cyc_check_proc(d,obj) Cyc_check_type2(d,Cyc_is_procedure, closureN_tag, obj)
+#define Cyc_check_num(d,obj) Cyc_check_type(d,Cyc_is_number, integer_tag, obj)
+#define Cyc_check_fixnum(d,obj) Cyc_check_type(d,Cyc_is_fixnum, integer_tag, obj)
+#define Cyc_check_int(d,obj) Cyc_check_type(d,Cyc_is_integer, integer_tag, obj)
+#define Cyc_check_str(d,obj) Cyc_check_type(d,Cyc_is_string, string_tag, obj)
+#define Cyc_check_sym(d,obj) Cyc_check_type(d,Cyc_is_symbol, symbol_tag, obj)
+#define Cyc_check_vec(d,obj) Cyc_check_type(d,Cyc_is_vector, vector_tag, obj)
+#define Cyc_check_bvec(d,obj) Cyc_check_type(d,Cyc_is_bytevector, bytevector_tag, obj)
+#define Cyc_check_port(d,obj) Cyc_check_type(d,Cyc_is_port, port_tag, obj)
+#define Cyc_check_mutex(d,obj) Cyc_check_type(d,Cyc_is_mutex, mutex_tag, obj)
+#define Cyc_check_cond_var(d,obj) Cyc_check_type(d,Cyc_is_cond_var, cond_var_tag, obj)
+#define Cyc_check_opaque(d,obj) Cyc_check_type(d,Cyc_is_opaque, c_opaque_tag, obj)
 void Cyc_invalid_type_error(void *data, int tag, object found);
 void Cyc_check_obj(void *data, int tag, object obj);
 void Cyc_check_bounds(void *data, const char *label, int len, int index);
@@ -141,27 +141,6 @@ object Cyc_global_set(void *thd, object * glo, object value);
 /* Prototypes for primitive functions. */
 
 /**
- * \defgroup prim_pairs Pairs and lists
- * @brief Functions for working with pairs and lists
- */
-/**@{*/
-object Cyc_car(void *data, object lis);
-object Cyc_cdr(void *data, object lis);
-list malloc_make_pair(object, object);
-object Cyc_set_cell(void *, object l, object val);
-object Cyc_set_car(void *, object l, object val);
-object Cyc_set_cdr(void *, object l, object val);
-object Cyc_length(void *d, object l);
-object Cyc_list2vector(void *data, object cont, object l);
-object Cyc_list2string(void *d, object cont, object lst);
-object Cyc_list(void *data, int argc, object cont, ...);
-object memberp(void *data, object x, list l);
-object memqp(void *data, object x, list l);
-list assq(void *data, object x, list l);
-list assoc(void *data, object x, list l);
-/**@}*/
-
-/**
  * \defgroup prim_ctrl Control flow
  * @brief Primitives that control the flow of program execution
  */
@@ -194,6 +173,7 @@ int binstr2int(const char *str);
 int octstr2int(const char *str);
 object Cyc_string_append(void *data, object cont, int argc, object str1, ...);
 object Cyc_string_length(void *data, object str);
+object Cyc_string_byte_length(void *data, object str);
 object Cyc_substring(void *data, object cont, object str, object start,
                      object end);
 object Cyc_string_ref(void *data, object str, object k);
@@ -266,6 +246,9 @@ object Cyc_io_close_output_port(void *data, object port);
 object Cyc_io_flush_output_port(void *data, object port);
 object Cyc_io_read_char(void *data, object cont, object port);
 object Cyc_io_peek_char(void *data, object cont, object port);
+object Cyc_write_u8(void *data, object c, object port);
+object Cyc_io_read_u8(void *data, object cont, object port);
+object Cyc_io_peek_u8(void *data, object cont, object port);
 object Cyc_io_read_line(void *data, object cont, object port);
 void Cyc_io_read_token(void *data, object cont, object port);
 /**@}*/
@@ -301,6 +284,44 @@ void Cyc_io_read_token(void *data, object cont, object port);
     d.value = OP(((integer_type *)z)->value); \
   } else if (type_of(z) == bignum_tag) { \
     d.value = OP(mp_get_double(&bignum_value(z))); \
+  } else { \
+    d.value = OP(((double_type *)z)->value); \
+  } \
+  return_closcall1(data, cont, &d)
+
+#define return_inexact_double_or_cplx_op_no_cps(data, ptr, OP, CPLX_OP, z) \
+  double unboxed; \
+  Cyc_check_num(data, z); \
+  if (obj_is_int(z)) { \
+    unboxed = OP(obj_obj2int(z)); \
+  } else if (type_of(z) == integer_tag) { \
+    unboxed = OP(((integer_type *)z)->value); \
+  } else if (type_of(z) == bignum_tag) { \
+    unboxed = OP(mp_get_double(&bignum_value(z))); \
+  } else if (type_of(z) == complex_num_tag) { \
+    double complex unboxed = CPLX_OP(complex_num_value(z)); \
+    assign_complex_num(ptr, unboxed); \
+    return ptr; \
+  } else { \
+    unboxed = OP(((double_type *)z)->value); \
+  } \
+  assign_double(ptr, unboxed); \
+  return ptr;
+
+#define return_inexact_double_or_cplx_op(data, cont, OP, CPLX_OP, z) \
+  make_double(d, 0.0); \
+  Cyc_check_num(data, z); \
+  if (obj_is_int(z)) { \
+    d.value = OP(obj_obj2int(z)); \
+  } else if (type_of(z) == integer_tag) { \
+    d.value = OP(((integer_type *)z)->value); \
+  } else if (type_of(z) == bignum_tag) { \
+    d.value = OP(mp_get_double(&bignum_value(z))); \
+  } else if (type_of(z) == complex_num_tag) { \
+    complex_num_type cn; \
+    double complex unboxed = CPLX_OP(complex_num_value(z)); \
+    assign_complex_num((&cn), unboxed); \
+    return_closcall1(data, cont, &cn); \
   } else { \
     d.value = OP(((double_type *)z)->value); \
   } \
@@ -376,6 +397,12 @@ object Cyc_fast_sum(void *data, object ptr, object x, object y);
 object Cyc_fast_sub(void *data, object ptr, object x, object y);
 object Cyc_fast_mul(void *data, object ptr, object x, object y);
 object Cyc_fast_div(void *data, object ptr, object x, object y);
+object Cyc_fast_list_2(object ptr, object x, object y);
+object Cyc_fast_list_3(object ptr, object a1, object a2, object a3);
+object Cyc_fast_list_4(object ptr, object a1, object a2, object a3, object a4);
+object Cyc_fast_vector_2(object ptr, object a1, object a2);
+object Cyc_fast_vector_3(object ptr, object a1, object a2, object a3);
+object Cyc_fast_vector_4(object ptr, object a1, object a2, object a3, object a4);
 object Cyc_bit_unset(void *data, object n1, object n2); 
 object Cyc_bit_set(void *data, object n1, object n2);
 object Cyc_num_op_va_list(void *data, int argc,
@@ -385,38 +412,57 @@ object Cyc_num_op_va_list(void *data, int argc,
 void Cyc_int2bignum(int n, mp_int *bn);
 object Cyc_bignum_normalize(void *data, object n);
 int Cyc_bignum_cmp(bn_cmp_type type, object x, int tx, object y, int ty);
+void Cyc_make_rectangular(void *data, object k, object r, object i);
 double MRG32k3a (double seed);
 /**@}*/
 /**
  * \defgroup prim_eq Equality and type predicates
  */
 /**@{*/
-object Cyc_eq(object x, object y);
+//object Cyc_eq(object x, object y);
+#define Cyc_eq(x, y) (make_boolean(x == y))
 int equal(object, object);
 object equalp(object, object);
 object Cyc_has_cycle(object lst);
-object Cyc_is_boolean(object o);
-//object Cyc_is_pair(object o);
+object Cyc_is_list(object lst);
+//object Cyc_is_boolean(object o);
+#define Cyc_is_boolean(o) (make_boolean(o == boolean_f || o == boolean_t))
 #define Cyc_is_pair(o) ((is_object_type(o) && ((list) o)->tag == pair_tag) ? boolean_t : boolean_f)
-object Cyc_is_null(object o);
+#define Cyc_is_null(o) (make_boolean(o == NULL))
+//TODO: convert all of these to macros (if it makes sense, most should), and remove them from runtime.c:
 object Cyc_is_number(object o);
+object Cyc_is_complex(object o);
 object Cyc_is_real(object o);
 object Cyc_is_integer(object o);
-object Cyc_is_fixnum(object o);
-object Cyc_is_bignum(object o);
-object Cyc_is_vector(object o);
-object Cyc_is_bytevector(object o);
-object Cyc_is_port(object o);
-object Cyc_is_mutex(object o);
-object Cyc_is_cond_var(object o);
-object Cyc_is_symbol(object o);
-object Cyc_is_string(object o);
-object Cyc_is_char(object o);
+#define Cyc_is_fixnum(o) (make_boolean(obj_is_int(o)))
+//object Cyc_is_fixnum(object o);
+#define Cyc_is_bignum(o)     (make_boolean(is_object_type(o) && ((list) o)->tag == bignum_tag))
+//object Cyc_is_bignum(object o);
+//object Cyc_is_vector(object o);
+//object Cyc_is_bytevector(object o);
+//object Cyc_is_port(object o);
+//object Cyc_is_mutex(object o);
+//object Cyc_is_cond_var(object o);
+//object Cyc_is_symbol(object o);
+//object Cyc_is_string(object o);
+#define Cyc_is_vector(o)     (make_boolean(is_object_type(o) && ((list) o)->tag == vector_tag))
+#define Cyc_is_bytevector(o) (make_boolean(is_object_type(o) && ((list) o)->tag == bytevector_tag))
+#define Cyc_is_port(o)       (make_boolean(is_object_type(o) && ((list) o)->tag == port_tag))
+#define Cyc_is_mutex(o)      (make_boolean(is_object_type(o) && ((list) o)->tag == mutex_tag))
+#define Cyc_is_cond_var(o)   (make_boolean(is_object_type(o) && ((list) o)->tag == cond_var_tag))
+#define Cyc_is_symbol(o)     (make_boolean(is_object_type(o) && ((list) o)->tag == symbol_tag))
+#define Cyc_is_string(o)     (make_boolean(is_object_type(o) && ((list) o)->tag == string_tag))
+//object Cyc_is_char(object o);
+#define Cyc_is_char(o) (make_boolean(obj_is_char(o)))
 object Cyc_is_procedure(void *data, object o);
-object Cyc_is_macro(object o);
-object Cyc_is_eof_object(object o);
-object Cyc_is_cvar(object o);
-object Cyc_is_opaque(object o);
+//object Cyc_is_macro(object o);
+//object Cyc_is_eof_object(object o);
+//object Cyc_is_cvar(object o);
+//object Cyc_is_opaque(object o);
+#define Cyc_is_macro(o)       (make_boolean(is_object_type(o) && ((list) o)->tag == macro_tag))
+#define Cyc_is_eof_object(o)  (make_boolean(is_object_type(o) && ((list) o)->tag == eof_tag))
+#define Cyc_is_cvar(o)        (make_boolean(is_object_type(o) && ((list) o)->tag == cvar_tag))
+#define Cyc_is_opaque(o)      (make_boolean(is_object_type(o) && ((list) o)->tag == c_opaque_tag))
 /**@}*/
 
 /**
@@ -497,7 +543,24 @@ object copy2heap(void *data, object obj);
  * @brief Functions for maintaining call history.
  */
 /**@{*/
-void Cyc_st_add(void *data, char *frame);
+
+//void Cyc_st_add(void *data, char *frame); migrated from runtime.c
+/**
+ * @brief Register a frame in the stack trace circular buffer.
+ * @param data Thread data object
+ * @param frame Name of the frame
+ */
+#define Cyc_st_add(data, frame) \
+{ \
+  gc_thread_data *thd = (gc_thread_data *) data; \
+  /* Do not allow recursion to remove older frames */ \
+  if ((char *)frame != thd->stack_prev_frame) { \
+    thd->stack_prev_frame = frame; \
+    thd->stack_traces[thd->stack_trace_idx] = frame; \
+    thd->stack_trace_idx = (thd->stack_trace_idx + 1) % MAX_STACK_TRACES; \
+  } \
+}
+
 void Cyc_st_print(void *data, FILE * out);
 /**@}*/
 
@@ -680,10 +743,7 @@ void Cyc_rt_raise_msg(void *data, const char *err);
  */
 /**@{*/
 object add_symbol(symbol_type * psym);
-object add_symbol_by_name(const char *name);
-object find_symbol_by_name(const char *name);
 object find_or_add_symbol(const char *name);
-char *_strdup(const char *s);
 /**@}*/
 
 /**
@@ -706,5 +766,64 @@ extern list global_table;
 void add_global(object * glo);
 void Cyc_set_globals_changed(gc_thread_data *thd);
 /**@}*/
+
+/**
+ * \defgroup prim_utf8 UTF-8
+ *
+ * @brief Unicode processing using UTF-8
+ */
+/**@{*/
+
+/** @brief Successful state */
+#define CYC_UTF8_ACCEPT 0
+
+/** @brief Invalid state */
+#define CYC_UTF8_REJECT 1
+
+/**
+ * Simple macro to make it more convenient to convert a single char
+ */
+#define Cyc_utf8_encode_char(dest, dest_size, char_value) \
+  Cyc_utf8_encode(dest, dest_size, &char_value, 1)
+
+int Cyc_utf8_encode(char *dest, int sz, uint32_t *src, int srcsz);
+int Cyc_utf8_count_code_points(uint8_t* s);
+uint32_t Cyc_utf8_validate_stream(uint32_t *state, char *str, size_t len); 
+uint32_t Cyc_utf8_validate(char *str, size_t len);
+/**@}*/
+
+/**
+ * \defgroup prim_pairs Pairs and lists
+ * @brief Functions for working with pairs and lists
+ */
+/**@{*/
+//object Cyc_car(void *data, object lis);
+//object Cyc_cdr(void *data, object lis);
+static inline object Cyc_car(void *data, object lis)
+{
+  Cyc_check_pair(data, lis);
+  return car(lis);
+}
+
+static inline object Cyc_cdr(void *data, object lis)
+{
+  Cyc_check_pair(data, lis);
+  return cdr(lis);
+}
+list malloc_make_pair(object, object);
+object Cyc_set_cell(void *, object l, object val);
+object Cyc_set_car(void *, object l, object val);
+object Cyc_set_cdr(void *, object l, object val);
+object Cyc_length(void *d, object l);
+object Cyc_list2vector(void *data, object cont, object l);
+object Cyc_list2string(void *d, object cont, object lst);
+object Cyc_list(void *data, int argc, object cont, ...);
+object memberp(void *data, object x, list l);
+object memqp(void *data, object x, list l);
+list assq(void *data, object x, list l);
+list assoc(void *data, object x, list l);
+list assoc_cdr(void *data, object x, list l);
+/**@}*/
+
 
 #endif                          /* CYCLONE_RUNTIME_H */

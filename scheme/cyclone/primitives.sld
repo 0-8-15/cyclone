@@ -8,7 +8,9 @@
 ;;;;
 (define-library (scheme cyclone primitives)
   (import (scheme base)
+          (scheme cyclone hashset)
           ;(scheme write)
+          (srfi 69)
   )
   (export
     prim?
@@ -17,6 +19,7 @@
     ;; TODO: replace w/list that cannot be precomputed: precompute-prim-app?
     prim-call?
     prim->c-func
+    prim->c-func-uses-alloca?
     prim/data-arg?
     prim/c-var-pointer
     prim/c-var-assign
@@ -44,18 +47,22 @@
         (cons (cons cps-sym inline-sym) *udf-cps->inline*))
       (set! *udf-prims* (cons inline-sym *udf-prims*)))
     (define (prim:udf? exp)
-      (member exp *udf-prims*))
+      (memq exp *udf-prims*))
+
+    (define *hs-prims* (hs-create))
 
     ; prim? : exp -> boolean
     (define (prim? exp)
-      (or (member exp *primitives*)
-          (member exp *udf-prims*)))
+      (or (hs-member? *hs-prims* exp)
+          (memq exp *udf-prims*)))
     
     ;; Does primitive mutate any of its arguments?
     (define (prim:mutates? exp)
-      (member 
+      (memq 
         exp
        '(
+         apply
+         Cyc-fast-apply
          Cyc-set-cvar!
          Cyc-spawn-thread!
          Cyc-end-thread!
@@ -105,6 +112,7 @@
          >=
          <=
          apply
+         Cyc-fast-apply
          %halt
          exit
          system
@@ -114,6 +122,13 @@
          Cyc-default-exception-handler
          Cyc-current-exception-handler
          cons
+         Cyc-fast-vector-2
+         Cyc-fast-vector-3
+         Cyc-fast-vector-4
+         Cyc-fast-list-1
+         Cyc-fast-list-2
+         Cyc-fast-list-3
+         Cyc-fast-list-4
          cell-get
          set-global!
          set-cell!
@@ -240,6 +255,7 @@
          (>= 2 #f)
          (<= 2 #f)
          (apply 1 #f)
+         (Cyc-fast-apply 2 #f)
          (%halt 1 1)
          (exit 1 1)
          (system 1 1)
@@ -249,6 +265,13 @@
          (Cyc-default-exception-handler 1 1)
          (Cyc-current-exception-handler 0 0)
          (cons 2 2)
+         (Cyc-fast-vector-2 2 2)
+         (Cyc-fast-vector-3 3 3)
+         (Cyc-fast-vector-4 4 4)
+         (Cyc-fast-list-1 1 1)
+         (Cyc-fast-list-2 2 2)
+         (Cyc-fast-list-3 3 3)
+         (Cyc-fast-list-4 4 4)
          (cell-get 1 1)
          (set-global! 2 2)
          (set-cell! 2 2)
@@ -389,7 +412,7 @@
 ;        (pair? ast)
 ;        (prim? (car ast))
 ;        ;; Does not make sense to precompute these
-;        (not (member (car ast)
+;        (not (memq (car ast)
 ;                    '(Cyc-global-vars
 ;                      Cyc-get-cvar
 ;                      Cyc-set-cvar!
@@ -447,7 +470,42 @@
     (define (prim-call? exp)
       (and (list? exp) (prim? (car exp))))
 
-    (define (prim->c-func p)
+    (define (prim->c-func-uses-alloca? p use-alloca?)
+      (and
+        use-alloca?
+        (member 
+           p 
+          '(;cons
+            ;Cyc-fast-list-1
+            ;Cyc-fast-list-2
+            ;Cyc-fast-list-3
+            ;Cyc-fast-list-4
+            ;cell
+           ))))
+
+;; TODO: get rid of this function and replace this with the same type of pre-alloc that
+;;       we do for fast numeric operations. That will allow us to prevent out-of-order 
+;;       execution for these as part of Cyc-seq
+    (define (prim->c-func p use-alloca?)
+      (cond
+         (use-alloca?
+          ;; Special case, when this flag is set the compiler is requesting a
+          ;; primitive that will allocate data, so any new objects must be
+          ;; created via alloca or such, and cannot be declared as stack vars.
+          ;; This is to support C loops in place of recursion.
+          (cond
+            ;((eq? p 'cons)            "alloca_pair")
+            ;((eq? p 'Cyc-fast-list-1) "alloca_list_1")
+            ;((eq? p 'Cyc-fast-list-2) "alloca_list_2")
+            ;((eq? p 'Cyc-fast-list-3) "alloca_list_3")
+            ;((eq? p 'Cyc-fast-list-4) "alloca_list_4")
+            ;((eq? p 'cell)            "alloca_cell")
+            (else
+              (_prim->c-func p))))
+         (else
+           (_prim->c-func p))))
+
+    (define (_prim->c-func p)
       (cond
          ((eq? p 'Cyc-global-vars)       "Cyc_get_global_variables")
          ((eq? p 'Cyc-get-cvar)          "Cyc_get_cvar")
@@ -486,6 +544,7 @@
          ((eq? p '>=)                    "Cyc_num_gte")
          ((eq? p '<=)                    "Cyc_num_lte")
          ((eq? p 'apply)                 "apply_va")
+         ((eq? p 'Cyc-fast-apply)        "apply")
          ((eq? p '%halt)                 "__halt")
          ((eq? p 'exit)                  "__halt")
          ((eq? p 'Cyc-default-exception-handler)  "Cyc_default_exception_handler")
@@ -594,8 +653,15 @@
          ((eq? p 'string?)       "Cyc_is_string")
          ((eq? p 'eof-object?)   "Cyc_is_eof_object")
          ((eq? p 'symbol?)       "Cyc_is_symbol")
-         ((eq? p 'cons)          "make_pair")
-         ((eq? p 'cell)          "make_cell")
+         ((eq? p 'cons)          "set_pair_as_expr")
+         ((eq? p 'Cyc-fast-vector-2) "Cyc_fast_vector_2")
+         ((eq? p 'Cyc-fast-vector-3) "Cyc_fast_vector_3")
+         ((eq? p 'Cyc-fast-vector-4) "Cyc_fast_vector_4")
+         ((eq? p 'Cyc-fast-list-1) "set_cell_as_expr")
+         ((eq? p 'Cyc-fast-list-2) "Cyc_fast_list_2")
+         ((eq? p 'Cyc-fast-list-3) "Cyc_fast_list_3")
+         ((eq? p 'Cyc-fast-list-4) "Cyc_fast_list_4")
+         ((eq? p 'cell)          "set_cell_as_expr")
          ((eq? p 'cell-get)      "car") ;; Unsafe as cell gets added by compiler
          ((eq? p 'set-cell!)     "Cyc_set_cell")
          ((eq? p 'set-global!)   "global_set")
@@ -605,7 +671,7 @@
     ;; Does the primitive require passing thread data as its first argument?
     (define (prim/data-arg? p)
      (or
-      (member p '(
+      (memq p '(
         Cyc-list
         Cyc-fast-plus
         Cyc-fast-sub
@@ -632,6 +698,7 @@
         <=
         Cyc-fast-member
         Cyc-fast-assoc
+        Cyc-fast-apply
         apply
         car
         cdr
@@ -696,18 +763,32 @@
         set-cdr!
         procedure?
         set-cell!))
-       (member p *udf-prims*)))
+       (memq p *udf-prims*)))
 
     ;; Determine if primitive receives a pointer to a local C variable
     (define (prim/c-var-pointer p)
       (cond
-        ((eq? p 'Cyc-fast-plus) "double_type")
-        ((eq? p 'Cyc-fast-sub) "double_type")
-        ((eq? p 'Cyc-fast-mul) "double_type")
-        ((eq? p 'Cyc-fast-div) "double_type")
-        ((member p *udf-prims*) "double_type")
+        ((eq? p 'cons) "pair_type")
+        ((eq? p 'cell) "pair_type")
+        ((eq? p 'Cyc-fast-vector-2) "vector_2_type")
+        ((eq? p 'Cyc-fast-vector-3) "vector_3_type")
+        ((eq? p 'Cyc-fast-vector-4) "vector_4_type")
+        ((eq? p 'Cyc-fast-list-1) "pair_type")
+        ((eq? p 'Cyc-fast-list-2) "list_2_type")
+        ((eq? p 'Cyc-fast-list-3) "list_3_type")
+        ((eq? p 'Cyc-fast-list-4) "list_4_type")
+        ((eq? p 'Cyc-fast-plus) "complex_num_type")
+        ((eq? p 'Cyc-fast-sub) "complex_num_type")
+        ((eq? p 'Cyc-fast-mul) "complex_num_type")
+        ((eq? p 'Cyc-fast-div) "complex_num_type")
+        ((memq p *udf-prims*) "complex_num_type")
         (else #f)))
 
+;; TODO: this only makes sense for macros, all functions need to be removed from here.
+;;       longer-term we need to fix issues with these functions, Cyc-seq, and the
+;;       possibility of out-of-order execution due to prims being evaluated at the
+;;       C declaration instead of in the body of the function
+;; TODO: does make sense for conts, those can't be in Cyc-seq. OK to keep those here
     ;; Determine if primitive assigns (allocates) a C variable
     ;; EG: int v = prim();
     (define (prim/c-var-assign p)
@@ -717,24 +798,24 @@
         ((eq? p 'Cyc-stderr) "port_type")
         ((eq? p 'open-input-file) "port_type")
         ((eq? p 'open-output-file) "port_type")
-        ((eq? p 'Cyc-fast-plus) "object")
-        ((eq? p 'Cyc-fast-sub) "object")
-        ((eq? p 'Cyc-fast-mul) "object")
-        ((eq? p 'Cyc-fast-div) "object")
+        ;((eq? p 'Cyc-fast-plus) "object")
+        ;((eq? p 'Cyc-fast-sub) "object")
+        ;((eq? p 'Cyc-fast-mul) "object")
+        ;;((eq? p 'Cyc-fast-div) "object")
         ((eq? p '+) "object")
         ((eq? p '-) "object")
         ((eq? p '*) "object")
         ((eq? p '/) "object")
-        ((eq? p 'Cyc-fast-eq) "object")
-        ((eq? p 'Cyc-fast-gt) "object")
-        ((eq? p 'Cyc-fast-lt) "object")
-        ((eq? p 'Cyc-fast-gte) "object")
-        ((eq? p 'Cyc-fast-lte) "object")
-        ((eq? p 'Cyc-fast-char-eq) "object")
-        ((eq? p 'Cyc-fast-char-gt) "object")
-        ((eq? p 'Cyc-fast-char-lt) "object")
-        ((eq? p 'Cyc-fast-char-gte) "object")
-        ((eq? p 'Cyc-fast-char-lte) "object")
+        ;((eq? p 'Cyc-fast-eq) "object")
+        ;((eq? p 'Cyc-fast-gt) "object")
+        ;((eq? p 'Cyc-fast-lt) "object")
+        ;((eq? p 'Cyc-fast-gte) "object")
+        ;((eq? p 'Cyc-fast-lte) "object")
+        ;((eq? p 'Cyc-fast-char-eq) "object")
+        ;((eq? p 'Cyc-fast-char-gt) "object")
+        ;((eq? p 'Cyc-fast-char-lt) "object")
+        ;((eq? p 'Cyc-fast-char-gte) "object")
+        ;((eq? p 'Cyc-fast-char-lte) "object")
         ((eq? p '=) "object")
         ((eq? p '>) "object")
         ((eq? p '<) "object")
@@ -743,6 +824,7 @@
         ((eq? p 'string->number) "object")
         ((eq? p 'string-append) "object")
         ((eq? p 'apply)  "object")
+        ((eq? p 'Cyc-fast-apply)  "object")
         ((eq? p 'Cyc-read-line) "object")
         ((eq? p 'Cyc-read-char) "object")
         ((eq? p 'Cyc-peek-char) "object")
@@ -761,14 +843,14 @@
         ((eq? p 'list->vector) "object")
         ((eq? p 'Cyc-installation-dir) "object")
         ((eq? p 'Cyc-compilation-environment) "object")
-        ((member p *udf-prims*) "object")
+        ;((memq p *udf-prims*) "object")
         (else #f)))
 
     ;; Determine if primitive creates a C variable
     (define (prim/cvar? exp)
         (and (prim? exp)
              (or
-               (member exp '(
+               (memq exp '(
                  Cyc-stdout
                  Cyc-stdin
                  Cyc-stderr
@@ -787,32 +869,42 @@
                  make-vector list->vector
                  symbol->string number->string 
                  substring
-                 Cyc-fast-plus
-                 Cyc-fast-sub
-                 Cyc-fast-mul
-                 Cyc-fast-div
-                 Cyc-fast-eq
-                 Cyc-fast-gt
-                 Cyc-fast-lt
-                 Cyc-fast-gte
-                 Cyc-fast-lte
-                 Cyc-fast-char-eq
-                 Cyc-fast-char-gt
-                 Cyc-fast-char-lt
-                 Cyc-fast-char-gte
-                 Cyc-fast-char-lte
-                 + - * / apply 
+                 ;Cyc-fast-plus
+                 ;Cyc-fast-sub
+                 ;Cyc-fast-mul
+                 ;Cyc-fast-div
+                 ;Cyc-fast-eq
+                 ;Cyc-fast-gt
+                 ;Cyc-fast-lt
+                 ;Cyc-fast-gte
+                 ;Cyc-fast-lte
+                 ;Cyc-fast-char-eq
+                 ;Cyc-fast-char-gt
+                 ;Cyc-fast-char-lt
+                 ;Cyc-fast-char-gte
+                 ;Cyc-fast-char-lte
+                 + - * / 
+                 apply 
+                 Cyc-fast-apply
                  = > < >= <=
                  command-line-arguments
                  Cyc-read-line
                  Cyc-read-char Cyc-peek-char
-                 cons cell))
-               (member exp *udf-prims*))))
+                 ;Cyc-fast-list-1
+                 ;Cyc-fast-list-2
+                 ;Cyc-fast-list-3
+                 ;Cyc-fast-list-4
+                 ;cons
+                 ;cell
+                ))
+               ;(memq exp *udf-prims*)
+               )))
 
     ;; Pass continuation as the function's first parameter?
     (define (prim:cont? exp)
       (and (prim? exp)
-           (member exp '(Cyc-read-line apply command-line-arguments number->string 
+           (memq exp '(Cyc-read-line apply command-line-arguments number->string 
+                         Cyc-fast-apply
                          + - * /
                          = > < >= <=
                          Cyc-list
@@ -834,12 +926,12 @@
     ;; Primitive functions that pass a continuation or thread data but have no other arguments
     (define (prim:cont/no-args? exp)
       (and (prim? exp)
-           (member exp '(command-line-arguments Cyc-current-exception-handler))))
+           (memq exp '(command-line-arguments Cyc-current-exception-handler))))
 
     ;; Pass an integer arg count as the function's first parameter?
     (define (prim:arg-count? exp)
         (and (prim? exp)
-             (member exp '(error Cyc-write Cyc-display 
+             (memq exp '(error Cyc-write Cyc-display 
                            number->string string->number string-append 
                            apply
                            make-bytevector
@@ -853,14 +945,18 @@
     ;; Does primitive allocate an object?
     ;; TODO: these are the functions that are defined via macros. This method
     ;; is obsolete and should be replaced by prim:cont? functions over time.
-    (define (prim:allocates-object? exp)
+    (define (prim:allocates-object? exp use-alloca?)
         (and  (prim? exp)
-              (member exp '())))
+              use-alloca?
+              (memq exp 
+                '(
+                ;cons
+                ))))
     
     ;; Does the primitive only accept/return immutable objects?
     ;; This is useful during optimization
     (define (prim:immutable-args/result? sym)
-      (member sym 
+      (memq sym 
              '(= > < >= <=
                + - * /
                Cyc-fast-plus
@@ -903,6 +999,8 @@
 
     (define (prim:inline-convert-prim-call prim-call)
       (cond
+        ((and (equal? (car prim-call) '+) (= (length prim-call) 2)) `(Cyc-fast-plus 0 ,@(cdr prim-call)))
+        ((and (equal? (car prim-call) '*) (= (length prim-call) 2)) `(Cyc-fast-mul 1 ,@(cdr prim-call)))
         ((equal? (car prim-call) '+) (->dyadic (cons 'Cyc-fast-plus (cdr prim-call))))
         ((equal? (car prim-call) '*) (->dyadic (cons 'Cyc-fast-mul (cdr prim-call))))
         ((and (equal? (car prim-call) '-) (= (length prim-call) 2)) `(Cyc-fast-sub 0 ,@(cdr prim-call))) ;; Special case, fast negation
@@ -914,6 +1012,7 @@
         ((and (equal? (car prim-call) '<) (= (length prim-call) 3))  (cons 'Cyc-fast-lt (cdr prim-call)))
         ((and (equal? (car prim-call) '>=) (= (length prim-call) 3)) (cons 'Cyc-fast-gte (cdr prim-call)))
         ((and (equal? (car prim-call) '<=) (= (length prim-call) 3)) (cons 'Cyc-fast-lte (cdr prim-call)))
+        ((and (equal? (car prim-call) 'apply) (= (length prim-call) 3)) (cons 'Cyc-fast-apply (cdr prim-call)))
         (else
          prim-call)))
 
@@ -965,4 +1064,6 @@
          (cdr udf))
         ;; No match; keep original function
         (else func-sym)))) 
+
+  (hs-add-all! *hs-prims* *primitives*)
 ))

@@ -37,14 +37,17 @@
     string-hash
     string-ci-hash
     hash-by-identity
+    ;; Cyclone Custom
+    Cyc-memoize
   )
   (import (scheme base)
           (scheme char)
-          (scheme complex)
-          ;(scheme cyclone util)
+          ;(scheme complex)
   )
   (begin
-(define *default-bound* (- (expt 2 29) 3))
+
+;; Increased to (2^30) - 1, hardcode to ensure fixnum
+(define *default-bound* 1073741823) ;;(- (expt 2 29) 3))
 
 (define (%string-hash s ch-conv bound)
   (let ((hash 31)
@@ -63,18 +66,43 @@
   (let ((bound (if (null? maybe-bound) *default-bound* (car maybe-bound))))
     (%string-hash s char-downcase bound)))
 
-(define (symbol-hash s . maybe-bound)
-  (let ((bound (if (null? maybe-bound) *default-bound* (car maybe-bound))))
-    (%string-hash (symbol->string s) (lambda (x) x) bound)))
+;; Symbols are unique by memory location, so replace old string comparison
+(define-c symbol-hash
+  "(void *data, int argc, closure _, object k, object sym)"
+  " return_closcall1(data, k, obj_int2obj(((long)sym) & 0x7FFFFFFF)); "
+  "(void *data, object ptr, object sym)"
+  " return obj_int2obj(((long)sym) & 0x7FFFFFFF); ")
+
+(define-c %real-part
+  "(void *data, int argc, closure _, object k, object z)"
+  " if (boolean_t == Cyc_is_complex(z)) {
+      make_double(d, creal(complex_num_value(z)));
+      return_closcall1(data, k, &d); 
+    } else {
+      return_closcall1(data, k, z); 
+    } ")
+
+(define-c %imag-part
+  "(void *data, int argc, closure _, object k, object z)"
+  " if (boolean_t == Cyc_is_complex(z)) {
+      make_double(d, cimag(complex_num_value(z)));
+      return_closcall1(data, k, &d); 
+    } else {
+      return_closcall1(data, k, z); 
+    } ")
 
 (define (hash obj . maybe-bound)
   (let ((bound (if (null? maybe-bound) *default-bound* (car maybe-bound))))
     (cond ((integer? obj) (modulo obj bound))
     ((string? obj) (string-hash obj bound))
-    ((symbol? obj) (symbol-hash obj bound))
-    ((real? obj) (modulo (+ (numerator obj) (denominator obj)) bound))
+    ((symbol? obj) 
+     ;(symbol-hash obj bound)
+     (modulo (symbol-hash obj) bound)
+    )
+    ((and (real? obj) (not (complex? obj)))
+     (modulo (+ (numerator obj) (denominator obj)) bound))
     ((number? obj)
-     (modulo (+ (hash (real-part obj)) (* 3 (hash (imag-part obj))))
+     (modulo (+ (hash (%real-part obj)) (* 3 (hash (%imag-part obj))))
        bound))
     ((char? obj) (modulo (char->integer obj) bound))
     ((vector? obj) (vector-hash obj bound))
@@ -85,7 +113,10 @@
     ((procedure? obj) (error "hash: procedures cannot be hashed" obj))
     (else 1))))
 
-(define hash-by-identity hash)
+(define (hash-by-identity obj . maybe-bound)
+  (let ((bound (if (null? maybe-bound) *default-bound* (car maybe-bound)))
+        (mem-loc (symbol-hash obj))) ;; Obj memory location (or value) as fixnum
+    (modulo mem-loc bound)))
 
 (define (vector-hash v bound)
   (let ((hashvalue 571)
@@ -297,5 +328,26 @@
 
 (define (hash-table-values hash-table)
   (hash-table-fold hash-table (lambda (key val acc) (cons val acc)) '()))
+
+;; Cyclone-specific
+;;
+;; Take a function and return another function that will store the results
+;; of calling the original function, and return those cached results on 
+;; subsequent requests.
+(define (Cyc-memoize function) 
+  (let ((table (make-hash-table))) ;(make-equal?-map))) 
+    (lambda args 
+      (apply values 
+             ;(map-get table 
+             (hash-table-ref table 
+                      args 
+                      ;; If the entry isn't there, call the function.    
+                      (lambda () 
+                        (call-with-values 
+                          (lambda () (apply function args)) 
+                          (lambda results 
+                            ;(map-put! table args results) 
+                            (hash-table-set! table args results) 
+                            results)))))))) 
 
 ))

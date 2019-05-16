@@ -18,18 +18,15 @@
           (scheme cyclone ast)
           (scheme cyclone common)
           (scheme cyclone libraries)
-          (scheme cyclone macros)
           (scheme cyclone primitives)
           (scheme cyclone pretty-print)
           (scheme cyclone util)
           (srfi 69)
   )
   (export
-    *defined-macros* 
     *do-code-gen*
     *trace-level*
     *primitives*
-    get-macros
     built-in-syms
     trace
     trace:error
@@ -67,8 +64,6 @@
     app->args 
     precompute-prim-app? 
     begin->exps 
-    define-lambda? 
-    define->lambda 
     closure? 
     closure->lam 
     closure->env 
@@ -88,8 +83,6 @@
     cell->value 
     cell-get? 
     cell-get->cell 
-    expand 
-    expand-lambda-body
     isolate-globals 
     has-global? 
     global-vars 
@@ -126,10 +119,6 @@
     void
   )
   (begin
-
-;; Container for built-in macros
-(define (get-macros) *defined-macros*)
-(define *defined-macros* (list))
 
 (define (built-in-syms)
   '(call/cc define))
@@ -188,18 +177,88 @@
   (else #f))
 
 ; symbol<? : symbol symobl -> boolean
-(define (symbol<? sym1 sym2)
-  (string<? (symbol->string sym1)
-            (symbol->string sym2)))
+;(define (symbol<? sym1 sym2)
+;  (string<? (symbol->string sym1)
+;            (symbol->string sym2)))
+
+(define-c symbol<?
+  "(void *data, int argc, closure _, object k, object sym1, object sym2)"
+  "
+     Cyc_check_sym(data, sym1);
+     Cyc_check_sym(data, sym2);
+     object result = (strcmp(symbol_desc(sym1), symbol_desc(sym2)) < 0) 
+                     ? boolean_t : boolean_f;
+     return_closcall1(data, k, result);
+  "
+  "(void *data, object ptr, object sym1, object sym2)"
+  " 
+     Cyc_check_sym(data, sym1);
+     Cyc_check_sym(data, sym2);
+     object result = (strcmp(symbol_desc(sym1), symbol_desc(sym2)) < 0) 
+                     ? boolean_t : boolean_f;
+     return result;
+  ")
 
 ; insert : symbol sorted-set[symbol] -> sorted-set[symbol]
-(define (insert sym S)
-  (if (not (pair? S))
-      (list sym)
-      (cond
-        ((eq? sym (car S))       S)
-        ((symbol<? sym (car S))  (cons sym S))
-        (else (cons (car S) (insert sym (cdr S)))))))
+;(define (insert sym S)
+;  (if (not (pair? S))
+;      (list sym)
+;      (cond
+;        ((eq? sym (car S))       S)
+;        ((symbol<? sym (car S))  (cons sym S))
+;        (else (cons (car S) (insert sym (cdr S)))))))
+;
+(define-c insert
+ "(void *data, int argc, closure _,object k_7318, object sym_731_7312, object S_732_7313)"
+ "
+ pair_type *acc = NULL, *acc_tail = NULL;
+ object result;
+ while(1) {
+  if( (boolean_f != Cyc_is_pair(S_732_7313)) ){
+    if( (boolean_f != Cyc_eq(sym_731_7312, Cyc_car(data, S_732_7313))) ){
+      //return_closcall1(data,  k_7318,  S_732_7313);
+      result = S_732_7313;
+      break;
+    } else {
+      if (strcmp(symbol_desc(sym_731_7312),
+                 symbol_desc(Cyc_car(data, S_732_7313))) < 0) {
+        //pair_type local_7356;
+        //return_closcall1(data,  k_7318,  set_pair_as_expr(&local_7356, sym_731_7312, S_732_7313));
+        pair_type* local_7356 = alloca(sizeof(pair_type));
+        set_pair(local_7356, sym_731_7312, S_732_7313);
+        result = local_7356;
+        break;
+      } else {
+        pair_type *p = alloca(sizeof(pair_type));
+        set_pair(p, Cyc_car(data, S_732_7313), NULL);
+        if (acc == NULL) {
+          acc = p;
+          acc_tail = acc;
+        } else {
+          cdr(acc_tail) = p;
+          acc_tail = p;
+        }
+        S_732_7313 = Cyc_cdr(data, S_732_7313);
+        continue;
+      }
+    }
+  } else {
+    //pair_type local_7363;
+    //return_closcall1(data,  k_7318,  set_cell_as_expr(&local_7363, sym_731_7312));
+    pair_type *local_7363 = alloca(sizeof(pair_type));
+    set_pair(local_7363, sym_731_7312, NULL);
+    result = local_7363;
+    break;
+  }
+}
+
+if (acc) {
+  cdr(acc_tail) = result;
+  return_closcall1(data, k_7318, (object)acc);
+} else {
+  return_closcall1(data, k_7318, result);
+}
+")
 
 ; remove : symbol sorted-set[symbol] -> sorted-set[symbol]
 (define (remove sym S)
@@ -411,26 +470,6 @@
 (define (begin->exps exp)
   (cdr exp))
 
-(define (define-lambda? exp)
-  (let ((var (cadr exp)))
-    (or
-      ;; Standard function
-      (and (list? var) 
-           (> (length var) 0)
-           (symbol? (car var)))
-      ;; Varargs function
-      (and (pair? var)
-           (symbol? (car var))))))
-
-(define (define->lambda exp)
-  (cond
-    ((define-lambda? exp)
-     (let ((var (caadr exp))
-           (args (cdadr exp))
-           (body (cddr exp)))
-       `(define ,var (lambda ,args ,@body))))
-    (else exp)))
-
 ; closure? : exp -> boolean
 (define (closure? exp) 
   (tagged-list? 'closure exp))
@@ -505,199 +544,6 @@
 ; cell-get->cell : cell-exp -> exp
 (define (cell-get->cell exp)
   (cadr exp))
-
-
-;; Macro expansion
-
-;TODO: modify this whole section to use macros:get-env instead of *defined-macros*. macro:get-env becomes the mac-env. any new scopes need to extend that env, and an env parameter needs to be added to (expand). any macros defined with define-syntax use that env as their mac-env (how to store that)?
-; expand : exp -> exp
-(define (expand exp env rename-env)
-  (define (log e)
-    (display  
-      (list 'expand e 'env 
-        (env:frame-variables (env:first-frame env))) 
-      (current-error-port))
-    (newline (current-error-port)))
-  ;(log exp)
-  ;(trace:error `(expand ,exp))
-  (cond
-    ((const? exp)      exp)
-    ((prim? exp)       exp)
-    ((ref? exp)        exp)
-    ((quote? exp)      exp)
-    ((lambda? exp)     `(lambda ,(lambda->formals exp)
-                          ,@(expand-body '() (lambda->exp exp) env rename-env)
-                          ;,@(map 
-                          ;  ;; TODO: use extend env here?
-                          ;  (lambda (expr) (expand expr env rename-env))
-                          ;  (lambda->exp exp))
-                         ))
-    ((define? exp)     (if (define-lambda? exp)
-                           (expand (define->lambda exp) env rename-env)
-                          `(define ,(expand (define->var exp) env rename-env)
-                                ,@(expand (define->exp exp) env rename-env))))
-    ((set!? exp)       `(set! ,(expand (set!->var exp) env rename-env)
-                              ,(expand (set!->exp exp) env rename-env)))
-    ((if-syntax? exp)  `(if ,(expand (if->condition exp) env rename-env)
-                            ,(expand (if->then exp) env rename-env)
-                            ,(if (if-else? exp)
-                                 (expand (if->else exp) env rename-env)
-                                 ;; Insert default value for missing else clause
-                                 ;; FUTURE: append the empty (unprinted) value
-                                 ;; instead of #f
-                                 #f)))
-    ((define-c? exp) exp)
-    ((define-syntax? exp)
-     ;(trace:info `(define-syntax ,exp))
-     (let* ((name (cadr exp))
-            (trans (caddr exp))
-            (body (cadr trans)))
-       (cond
-        ((tagged-list? 'syntax-rules trans) ;; TODO: what if syntax-rules is renamed?
-         (expand
-           `(define-syntax ,name ,(expand trans env rename-env))
-           env rename-env))
-        (else
-         ;; TODO: for now, do not let a compiled macro be re-defined.
-         ;; this is a hack for performance compiling (scheme base)
-         (let ((macro (env:lookup name env #f)))
-          (cond
-            ((and (tagged-list? 'macro macro)
-                  (or (Cyc-macro? (Cyc-get-cvar (cadr macro)))
-                      (procedure? (cadr macro))))
-             (trace:info `(DEBUG compiled macro ,name do not redefine)))
-            (else
-             ;; Use this to keep track of macros for filtering unused defines
-             (set! *defined-macros* (cons (cons name body) *defined-macros*))
-             ;; Keep track of macros added during compilation.
-             ;; TODO: why in both places?
-             (macro:add! name body)
-             (env:define-variable! name (list 'macro body) env)))
-          ;; Keep as a 'define' form so available at runtime
-          ;; TODO: may run into issues with expanding now, before some
-          ;; of the macros are defined. may need to make a special pass
-          ;; to do loading or expansion of macro bodies
-          `(define ,name ,(expand body env rename-env)))))))
-    ((app? exp)
-     (cond
-       ((symbol? (car exp))
-        (let ((val (env:lookup (car exp) env #f)))
-          (if (tagged-list? 'macro val)
-            (expand ; Could expand into another macro
-              (macro:expand exp val env rename-env)
-              env rename-env)
-            (map
-              (lambda (expr) (expand expr env rename-env))
-              exp))))
-       (else
-         ;; TODO: note that map does not guarantee that expressions are
-         ;; evaluated in order. For example, the list might be processed
-         ;; in reverse order. Might be better to use a fold here and
-         ;; elsewhere in (expand).
-         (map 
-          (lambda (expr) (expand expr env rename-env))
-          exp))))
-    (else
-      (error "unknown exp: " exp))))
-
-;; Nicer interface to expand-body
-(define (expand-lambda-body exp env rename-env)
-  (expand-body '() exp env rename-env))
-
-;; Helper to expand a lambda body, so we can splice in any begin's
-(define (expand-body result exp env rename-env)
-  (define (log e)
-    (display (list 'expand-body e 'env 
-              (env:frame-variables (env:first-frame env))) 
-             (current-error-port))
-    (newline (current-error-port)))
-
-  (if (null? exp) 
-    (reverse result)
-    (let ((this-exp (car exp)))
-;(display (list 'expand-body this-exp) (current-error-port))
-;(newline (current-error-port))
-      (cond
-       ((or (const? this-exp)
-            (prim? this-exp)
-            (ref? this-exp)
-            (quote? this-exp)
-            (define-c? this-exp))
-;(log this-exp)
-        (expand-body (cons this-exp result) (cdr exp) env rename-env))
-       ((define? this-exp)
-;(log this-exp)
-        (expand-body 
-          (cons
-            (expand this-exp env rename-env)
-            result)
-          (cdr exp)
-          env
-          rename-env))
-       ((or (define-syntax? this-exp)
-            (lambda? this-exp)
-            (set!? this-exp)
-            (if? this-exp))
-;(log (car this-exp))
-        (expand-body 
-          (cons
-            (expand this-exp env rename-env)
-            result)
-          (cdr exp)
-          env
-          rename-env))
-       ;; Splice in begin contents and keep expanding body
-       ((begin? this-exp)
-        (let* ((expr this-exp)
-               (begin-exprs (begin->exps expr)))
-;(log (car this-exp))
-        (expand-body
-         result
-         (append begin-exprs (cdr exp))
-         env
-         rename-env)))
-       ((app? this-exp)
-        (cond
-          ((symbol? (caar exp))
-;(log (car this-exp))
-           (let ((val (env:lookup (caar exp) env #f)))
-;(log `(DONE WITH env:lookup ,(caar exp) ,val ,(tagged-list? 'macro val)))
-            (if (tagged-list? 'macro val)
-              ;; Expand macro here so we can catch begins in the expanded code,
-              ;; including nested begins
-              (let ((expanded (macro:expand this-exp val env rename-env)))
-;(log `(DONE WITH macro:expand))
-                (expand-body
-                  result
-                  (cons 
-                    expanded ;(macro:expand this-exp val env)
-                    (cdr exp))
-                  env
-                  rename-env))
-              ;; No macro, use main expand function to process
-              (expand-body
-               (cons 
-                 (map
-                  (lambda (expr) (expand expr env rename-env))
-                  this-exp)
-                 result)
-               (cdr exp)
-               env
-               rename-env))))
-          (else
-;(log 'app)
-           (expand-body
-             (cons 
-               (map
-                (lambda (expr) (expand expr env rename-env))
-                this-exp)
-               result)
-             (cdr exp)
-             env
-             rename-env))))
-       (else
-        (error "unknown exp: " this-exp))))))
-
 
 ;; Top-level analysis
 
@@ -847,6 +693,7 @@
 
 ; free-vars : exp -> sorted-set[var]
 (define (free-vars ast . opts)
+  (define let-vars '())
   (define bound-only? 
     (and (not (null? opts))
          (car opts)))
@@ -854,10 +701,19 @@
   (define (search exp)
     (cond
       ; Core forms:
+      ((ast:lambda? exp)
+        (difference (reduce union (map search (ast:lambda-body exp)) '())
+                    (ast:lambda-formals->list exp)))
       ((const? exp)    '())
-      ((prim? exp)     '())    
       ((quote? exp)    '())    
-      ((ref? exp)      (if bound-only? '() (list exp)))
+      ((ref? exp)      
+       (cond
+        ((prim? exp)     
+         '())    
+        (else
+         (if (member exp let-vars)
+             '()
+             (if bound-only? '() (list exp))))))
       ((lambda? exp)   
         (difference (reduce union (map search (lambda->exp exp)) '())
                     (lambda-formals->list exp)))
@@ -869,6 +725,9 @@
       ((define-c? exp) (list (define->var exp)))
       ((set!? exp)     (union (list (set!->var exp)) 
                               (search (set!->exp exp))))
+      ((tagged-list? 'let exp)
+       (set! let-vars (append (map car (cadr exp)) let-vars))
+       (search (cdr exp)))
       ; Application:
       ((app? exp)       (reduce union (map search exp) '()))
       (else             (error "unknown expression: " exp))))
@@ -950,22 +809,34 @@
 ; wrap-mutables : exp -> exp
 (define (wrap-mutables exp globals)
   
-  (define (wrap-mutable-formals formals body-exp)
+  (define (wrap-mutable-formals id formals body-exp has-cont)
     (if (not (pair? formals))
         body-exp
+        ;(list body-exp)
         (if (is-mutable? (car formals))
-            `((lambda (,(car formals))
-                ,(wrap-mutable-formals (cdr formals) body-exp))
-              (cell ,(car formals)))
-            (wrap-mutable-formals (cdr formals) body-exp))))
+            (list
+              (list ;(ast:%make-lambda
+                    ;  id
+                    (ast:make-lambda
+                      (list (car formals))
+                      (wrap-mutable-formals id (cdr formals) body-exp has-cont)
+                      has-cont)
+                    `(cell ,(car formals))))
+            (wrap-mutable-formals id (cdr formals) body-exp has-cont))))
   
   (cond
     ; Core forms:
     ((ast:lambda? exp)
-     `(lambda ,(ast:lambda-args exp)
-       ,(wrap-mutable-formals 
+     (ast:%make-lambda
+       (ast:lambda-id exp)
+       (ast:lambda-args exp)
+       (wrap-mutable-formals 
+         (ast:lambda-id exp)
          (ast:lambda-formals->list exp)
-         (wrap-mutables (car (ast:lambda-body exp)) globals)))) ;; Assume single expr in lambda body, since after CPS phase
+         (list (wrap-mutables (car (ast:lambda-body exp)) globals))
+         (ast:lambda-has-cont exp))
+       (ast:lambda-has-cont exp)
+       )) ;; Assume single expr in lambda body, since after CPS phase
     ((const? exp)    exp)
     ((ref? exp)      (if (and (not (member exp globals))
                               (is-mutable? exp))
@@ -973,9 +844,7 @@
                          exp))
     ((prim? exp)     exp)
     ((quote? exp)    exp)
-    ((lambda? exp)   `(lambda ,(lambda->formals exp)
-                        ,(wrap-mutable-formals (lambda-formals->list exp)
-                                               (wrap-mutables (car (lambda->exp exp)) globals)))) ;; Assume single expr in lambda body, since after CPS phase
+    ((lambda? exp)   (error `(Unexpected lambda in wrap-mutables ,exp)))
     ((set!? exp)     `(,(if (member (set!->var exp) globals)
                             'set-global!
                             'set-cell!) 
@@ -987,6 +856,9 @@
     
     ; Application:
     ((app? exp)
+     ;; Easy place to clean up nested Cyc-seq expressions
+     (when (tagged-list? 'Cyc-seq exp)
+           (set! exp (flatten-sequence exp)))
      (let ((result (map (lambda (e) (wrap-mutables e globals)) exp)))
        ;; This code can eliminate a lambda definition. But typically
        ;; the code that would have such a definition has a recursive
@@ -1016,6 +888,42 @@
        ;; (else result))))
        result))
     (else            (error "unknown expression type: " exp))))
+
+;; Flatten a list containing subcalls of a given symbol.
+;; For example, the expression: 
+;;
+;;  '(Cyc-seq
+;;         (set! b '(#f . #f))
+;;         (Cyc-seq
+;;           (set-car!  a 1)
+;;           (Cyc-seq
+;;             (set-cdr!  a '(2))
+;;             ((fnc a1 a2 a3)))))
+;;
+;; becomes:
+;;
+;;  '(Cyc-seq
+;;     (set! b '(#f . #f))
+;;     (set-car! a 1)
+;;     (set-cdr! a '(2))
+;;     ((fnc a1 a2 a3)))
+;;
+(define (flatten-sequence sexp)
+  (define (flat sexp acc)
+    (cond
+      ((not (pair? sexp)) ;; Stop at end of sexp
+       acc)
+      ((and (tagged-list? 'Cyc-seq (car sexp))) ;; Flatten nexted sequences
+        (flat (cdar sexp) acc))
+      ((and (ref? (car sexp)) ;; Remove unused identifiers
+            (not (equal? 'Cyc-seq (car sexp))))
+        (flat (cdr sexp) acc))
+      (else ;;(pair? sexp)
+        (flat (cdr sexp) (cons (car sexp) acc))))
+  )
+  (reverse
+    (flat sexp '())))
+
 
 ;; Alpha conversion
 ;; (aka alpha renaming)
@@ -1088,13 +996,52 @@
        (let ((new-ast (if (if-else? ast)
                           `(if ,@(map (lambda (a) (convert a renamed)) (cdr ast)))
                           (convert (append ast '(#f)) renamed))))
-         ;; Optimization - convert (if (not a) b c) into (if a c b)
          (cond
+          ;; Optimization - convert (if (not a) b c) into (if a c b)
           ((and (app? (if->condition new-ast))
                 (equal? 'not (app->fun (if->condition new-ast))))
            `(if ,@(app->args (if->condition new-ast))
                 ,(if->else new-ast)
                 ,(if->then new-ast)))
+          ;; Optimization - convert (if expr #t #f) into expr
+          ((and (eq? #t (if->then new-ast))
+                (eq? #f (if->else new-ast))
+                (app? (if->condition new-ast))
+                (member 
+                  (car (if->condition new-ast)) 
+                  '(Cyc-fast-eq
+                    Cyc-fast-gt
+                    Cyc-fast-lt
+                    Cyc-fast-gte
+                    Cyc-fast-lte
+                    Cyc-fast-char-eq
+                    Cyc-fast-char-gt
+                    Cyc-fast-char-lt
+                    Cyc-fast-char-gte
+                    Cyc-fast-char-lte
+                    eq?
+                    eqv?
+                    equal?
+                    boolean?
+                    char?
+                    eof-object?
+                    null?
+                    number?
+                    real?
+                    integer?
+                    pair?
+                    port?
+                    procedure?
+                    Cyc-macro?
+                    vector?
+                    string?
+                    symbol?
+                    =
+                    >
+                    <
+                    >=
+                    <=))) ;; Boolean return
+           (if->condition new-ast))
           (else
             new-ast))))
       ((and (prim-call? ast)
@@ -1137,27 +1084,46 @@
                    (append a-lookup defines-a-lookup renamed))
                 (map (lambda (p) (cdr p)) defines-a-lookup)))))
       ((app? ast)
-       (cond
-        ;; Special case, convert these to primitives if possible
-        ((and (eq? (car ast) 'member)
-              (not (assoc (car ast) renamed))
-              (= (length ast) 3))
-         (cons 'Cyc-fast-member
-               (map (lambda (a) (convert a renamed)) (cdr ast))))
-        ((and (eq? (car ast) 'assoc)
-              (not (assoc (car ast) renamed))
-              (= (length ast) 3))
-         (cons 'Cyc-fast-assoc
-               (map (lambda (a) (convert a renamed)) (cdr ast))))
-        ;; Regular case, alpha convert everything
-        (else
-         (map (lambda (a) (convert a renamed)) ast))))
+       (let ((regular-case 
+               (lambda ()
+                 ;; Regular case, alpha convert everything
+                 (map (lambda (a) (convert a renamed)) ast))))
+         (cond
+          ;; If identifier is renamed it is not a special case
+          ((assoc (car ast) renamed)
+           (regular-case))
+          ;; Special case, convert these to primitives if possible
+          ((and (eq? (car ast) 'member) (= (length ast) 3))
+           (cons 'Cyc-fast-member (map (lambda (a) (convert a renamed)) (cdr ast))))
+          ((and (eq? (car ast) 'assoc) (= (length ast) 3))
+           (cons 'Cyc-fast-assoc (map (lambda (a) (convert a renamed)) (cdr ast))))
+          ((and (eq? (car ast) 'vector) (= (length ast) 3))
+           (cons 'Cyc-fast-vector-2 (map (lambda (a) (convert a renamed)) (cdr ast))))
+          ((and (eq? (car ast) 'vector) (= (length ast) 4))
+           (cons 'Cyc-fast-vector-3 (map (lambda (a) (convert a renamed)) (cdr ast))))
+          ((and (eq? (car ast) 'vector) (= (length ast) 5))
+           (cons 'Cyc-fast-vector-4 (map (lambda (a) (convert a renamed)) (cdr ast))))
+          ((and (eq? (car ast) 'list) (= (length ast) 2))
+           (cons 'Cyc-fast-list-1 (map (lambda (a) (convert a renamed)) (cdr ast))))
+          ((and (eq? (car ast) 'list) (= (length ast) 3))
+           (cons 'Cyc-fast-list-2 (map (lambda (a) (convert a renamed)) (cdr ast))))
+          ((and (eq? (car ast) 'list) (= (length ast) 4))
+           (cons 'Cyc-fast-list-3 (map (lambda (a) (convert a renamed)) (cdr ast))))
+          ((and (eq? (car ast) 'list) (= (length ast) 5))
+           (cons 'Cyc-fast-list-4 (map (lambda (a) (convert a renamed)) (cdr ast))))
+          ((and (eq? (car ast) 'for-each) (= (length ast) 3))
+           (cons 'Cyc-for-each-loop-1 (map (lambda (a) (convert a renamed)) (cdr ast))))
+          ((and (eq? (car ast) 'map) (= (length ast) 3))
+           (cons 'Cyc-map-loop-1 (map (lambda (a) (convert a renamed)) (cdr ast))))
+          ;; Regular case, alpha convert everything
+          (else
+           (regular-case)))))
       (else
         (error "unhandled expression: " ast))))
 
   (let* ((fv (difference (free-vars ast) globals))
          ;; Only find set! and lambda vars
-         (bound-vars (union globals (free-vars ast #t)))
+         (bound-vars (union (free-vars ast #t) globals))
          ;; vars never bound in prog, but could be built-in
          (unbound-vars (difference fv bound-vars))
          ;; vars we know nothing about - error!

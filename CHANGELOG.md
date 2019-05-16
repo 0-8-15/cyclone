@@ -1,11 +1,226 @@
 # Changelog
 
-## 0.7 - TBD
+## 0.11.1 - TBD
+
+Bug Fixes
+
+- Fixed a bug where the compiler would not always validate the number of arguments passed to a locally-defined function.
+
+## 0.11 - April 16, 2019
 
 Features
 
+- During compilation validate the number of arguments passed to locally-defined functions.
+- Improve performance of compiled code a bit by inlining code that tracks call history instead of using a dedicated function in the runtime.
+- Updated build instructions for Mac, thanks Adam Feuer!
+
+Bug Fixes
+
+- Allow `exit` to return an integer value as the return code to the OS.
+
+## 0.10 - March 28, 2019
+
+Features
+
+- Improve performance in generated C code by allocating data for closures statically where possible, instead of via `alloca`.
+- Speed up `case` expressions by using nested `if` expressions instead of the `memv` primitive to evaluate conditions with more than one constant. The nested expressions have better cache locality and also avoid any additional object allocation or initialization.
+- Allow passing the `'bin` symbol to `Cyc-installation-dir` to return the location of the installation directory for binaries.
+
+Bug Fixes
+
+- Prevent the possibility of a segmentation fault when passing am improper list to the `member` and `assoc` family of functions.
+
+## 0.9.10 - March 5, 2019
+
+Features
+
+- Faster initialization of objects create via `define-record-type`.
+- Generate faster compiled code for calls to `vector` that contain less than five arguments.
+
+## 0.9.9 - February 19, 2019
+
+Bug Fixes
+
+- Fix from Petr Pražák to avoid compilation errors when using newer versions of LibTomMath.
+- Avoid cases where bignums are not initialized properly by the runtime and incorrectly retain a value of zero.
+- Handle the following edge case from R7RS:
+
+  > If `z` is a complex number, then `(real? z)` is true if and only if `(zero? (imag-part z))` is true. 
+
+## 0.9.8 - February 16, 2019
+
+Features
+
+- Memoize recursive calls to pure functions where possible.
+
+Bug Fixes
+
+- Arthur Maciel fixed a bug in the compiler back-end where a terminating semi-colon would not be emitted in the C code generated for a short program.
+
+Internal Compiler Enhancements
+
+- Arthur Maciel updated the `cgen` module to follow the [Riastradh style rules](https://mumble.net/~campbell/scheme/style.txt) for updating comments. Thanks Arthur!
+
+## 0.9.7 - January 19, 2019
+
+Features
+
+- Faster version of `list?`.
+- Faster compilation of large source files.
+- Do not inline `member` or `assoc` to avoid looping over the same list multiple times.
+
+Bug Fixes
+
+- Do not inline primitive calls when arguments to the call are mutated in the function body or mutated elsewhere via `set!`.
+- Modified generated code for `(inline)` functions to eliminate the possibility of out-of-order execution.
+- Fix a bug where beta expansion of an `if` expression can lead to compilation errors.
+
+## 0.9.6 - December 9, 2018
+
+Bug Fixes
+
+- Cleaned up generated code to ensure calls to primitives from functions that are combined are not executed out of order.
+- Fixed the `return_copy` macro in the runtime to handle being passed an expression instead of an object.
+
+## 0.9.5 - November 28, 2018
+
+Features
+
+- Improve performance of many internal C runtime functions by declaring them `static`.
+
+## 0.9.4 - November 25, 2018
+
+Compiler Optimizations
+
+- Optimize recursive functions by expressing the recursive calls using C iteration. This optimization is more effective when combined with the others listed below as they collectively increase the chances that a higher-level Scheme loop may be compiled down to a single C function. These C functions can then be "called" repeatedly using a `while` loop which is more efficient at a low level than repeated function calls.
+- Combine lambda functions that are only called for side effects.
+- Improve inlining of primitives that work with immutable objects.
+- Eliminate functions that are only used to define local variables.
+
+Features
+
+- Added a new feature `program` to `cond-expand` that is only defined when compiling a program. This allows, for example, a `.scm` file to contain a section of code that can be used to run unit tests when the file is compiled as a program. The same file can then be used in production to import code into a library. This is similar to using the `__main__` scope in a python program.
+
+Bug Fixes
+
+- Prevent GC segmentation fault on ARM platforms (Raspberry Pi 2).
+
+## 0.9.3 - October 1, 2018
+
+Features
+
+- Allow pretty printing of bytevectors.
+- Internal change to the compiler - preserve lambda AST forms throughout compilation process. This should make it easier to implement certain optimizations in future releases.
+
+Bug Fixes
+
+- Fix `input-port?`, `output-port?`, `input-port-open?`, and `output-port-open?` to return `#f` instead of raising an error when a non-port object is passed.
+- Fix overflow detection when performing fixnum multiplication to avoid undefined behavior in the C runtime.
+- Prevent warnings from the C compiler regarding `shifting a negative signed value is undefined` and `absolute value function 'abs' given an argument of type 'long' but has parameter of type 'int'`.
+
+## 0.9.2 - August 26, 2018
+
+Features
+
+- During CPS optimization allow inlining of operations on global variables that are mutated in other top-level functions.
+- Improved loop detection during CPS optimization phase.
+- Allow optimizing-out of basic `if` expressions of the form `(if (pred? ...) #t #f)` into `(pred? ...)`.
+- Perform slightly faster type checking for string, vector, and bytevector access functions.
+
+## 0.9.1 - August 9, 2018
+
+Bug Fixes
+
+- Fixed a nasty bug where, while a mutator is blocked after calling `set_thread_blocked`, the collector may copy an object the mutator is using from the stack to the heap. In this case we need to ensure the object is not corrupted when it is copied and that we sync the object's fields back up once the mutator is unblocked. Currently this only affects port objects in the runtime. Generally `read` was affected more than other I/O functions.
+- Fixed a handful of small garbage collection bugs from the previous round of development.
+
+## 0.9 - July 31, 2018
+
+This release significantly improves garbage collection performance by using [lazy sweeping](docs/Garbage-Collection-Using-Lazy-Sweeping.md).
+
+## 0.8.1 - July 2, 2018
+
+Features
+
+- Improved garbage collector performance for large heaps.
+- Generate faster compiled code for:
+  - `car`, `cdr`, and most built-in predicates.
+  - Calls to `list` that contain less than five arguments.
+  - Calls to `map` and `for-each` that only pass a single list.
+- Allow optimization of some simple self-recursive functions.
+- Allow the optimizer to beta expand a wider range of function calls. 
+
+Bug Fixes
+
+- Fixed a bug where `current-jiffy` was returning total clock time of the process. Such an approach cannot be used to measure time accurately when more than one thread is executing concurrently.
+- Prevent the possibility of an infinite loop by not beta expanding recursive function calls.
+
+## 0.8 - May 30, 2018
+
+Features
+
+- Added support for complex numbers.
+- When printing intermediate forms during debugging via `-t` Cyclone will now emit less verbose S-expressions for code in CPS form. To support this effort and make debugging easier, added helper functions `ast:ast->sexp`, `ast:sexp->ast`, and `ast:ast->pp-sexp` to `(scheme cyclone ast)`.
+- Avoid inlining function calls into named let loops to improve performance of compiled code.
+
+## 0.7.3 - May 7, 2018
+
+Features
+
+- Made several performance improvements to SRFI 69 hash tables, including:
+    - Massively improved lookup performance for symbols.
+    - Increased the max bound of hash tables to `(2 ^ 30) - 1`.
+    - Changed `hash-by-identity` to a high-performance builtin.
+- Added a `repl` function to `(scheme repl)` to make it easy to use a REPL from your own code.
+- Added basic support for square and curly brackets in place of parentheses.
+
+Bug Fixes
+
+- Fixed an off-by-one error in `read-line` where the function erroneously reported an extra character was read from `stdin`. Thanks to wasamasa for the bug report.
+- Fixed a CPS optimization issue where multiple copies of the same lambda are introduced during beta expansion, which causes the optimizer to potentially pick up the wrong value when optimizing-out function calls later on. Thanks to @Chant on Github for providing the report and a test program demonstrating the issue.
+- Updated the parser to recognize mnemonic escapes (EG: `\n`, `\a`, etc) and inline hex escapes as part of a symbol.
+
+## 0.7.2 - February 15, 2018
+
+Features
+
+- Added a `(scheme cyclone match)` library based on Alex Shinn's `match.scm` portable hygienic pattern matcher.
+- The compiler now emits a faster version of `apply` in cases where only two arguments are received.
+
+Bug Fixes
+
+- Made several improvements to macro hygiene by renaming local variable bindings during expansion. Added a unit test module covering many test cases.
+- Fixed many functions including `utf8->string`, `string->utf8`, `bytevector-copy`, `list->vector`, and `list->string` to heap allocate objects that exceed the maximum size for objects on the stack.
+- Prevent a compiler error when there is only one argument to `+` or `*`.
+
+## 0.7.1 - December 21, 2017
+
+Features
+
+- Added support for `let-syntax` and `letrec-syntax`.
+- Added the `(scheme repl)` library and `interaction-environment` function from R7RS.
+- Allow `eval` to recognize `syntax-rules` macros.
+- Added single-byte oriented I/O functions `read-u8`, `peek-u8`, and `write-u8` from R7RS.
+
+Internal Changes
+
+- Relocated all macro expansion code to the `(scheme eval)` module. Cyclone's `(scheme cyclone macros)` library is now obsolete.
+
+Bug Fixes
+
+- Added the `full-unicode` feature since Unicode is supported as of the 0.7 release.
+
+## 0.7 - November 17, 2017
+
+Features
+
+- Finally added Unicode support using UTF-8!
 - Allow a program to have macros expand into a top-level `import` expression.
 - Added continuous integration support thanks to Alex Arslan.
+
+Bug Fixes
+
+- Incorporated a patch from [0-8-15](https://github.com/0-8-15) to pass seconds to `thread-sleep!` instead of milliseconds. Fractional seconds are accepted as well for high-resolution timers.
 
 ## 0.6.3 - September 16, 2017
 

@@ -19,11 +19,14 @@
     ;; Record types
     define-record-type
     record?
+    is-a?
     register-simple-type
     make-type-predicate
     make-constructor
+    make-constructor/args
     make-getter
     make-setter
+    slot-ref
     slot-set!
     type-slot-offset
     ;; END records
@@ -81,6 +84,8 @@
     make-list
     list-copy
     map
+    Cyc-map-loop-1
+    Cyc-for-each-loop-1
     for-each
     list-tail
     list-ref
@@ -144,6 +149,7 @@
     open-input-bytevector
     open-output-bytevector
     features
+    Cyc-add-feature!
     Cyc-version
     any
     every
@@ -187,10 +193,10 @@
 ;    write-bytevector
 ;
 ;    : No unicode support at this time
-;    peek-u8
-;    read-u8
+    peek-u8
+    read-u8
 ;    u8-ready?
-;    write-u8
+    write-u8
 ;
 ;    ; No complex or rational numbers at this time
 ;    rationalize
@@ -210,7 +216,6 @@
 ;;;;
   )
   (inline
-    exact-integer?
     square
     quotient
     numerator
@@ -219,6 +224,7 @@
     negative?
     positive?
     zero?
+    list?
     not
     string>=?
     string>?
@@ -234,9 +240,17 @@
         (cons
           (string->symbol 
             (string-append "version-" *version-number*))
-          '(r7rs 
-            ieee-float
-            posix))))
+          *other-features*)))
+
+    (define *other-features* 
+            '(r7rs 
+              ieee-float
+              full-unicode
+              posix))
+
+    ;; Designed for internal use only, don't call this in user code!!
+    (define (Cyc-add-feature! sym)
+      (set! *other-features* (cons sym *other-features*)))
 
     (define (Cyc-version) *version-number*)
 
@@ -432,6 +446,12 @@
                 `(,(cadr exprs) ,(rename 'tmp)))
                (else
                 `(,(rename 'begin) ,@exprs))))
+            (define (agg-cond tmp-sym lis)
+              (if (null? lis)
+                  #f
+                  `(if (eq? ,tmp-sym (,(rename 'quote) ,(car lis)))
+                       #t
+                       ,(agg-cond tmp-sym (cdr lis)))))
             (define (clause ls)
               (cond
                ((null? ls) #f)
@@ -443,8 +463,10 @@
                   ,(body (cdar ls))
                   ,(clause (cdr ls))))
                (else
-                `(,(rename 'if) (,(rename 'memv) ,(rename 'tmp)
-                                 (,(rename 'quote) ,(caar ls)))
+                `(,(rename 'if) 
+                      ,(agg-cond (rename 'tmp) (caar ls))
+                      ;(,(rename 'memv) ,(rename 'tmp)
+                      ; (,(rename 'quote) ,(caar ls)))
                   ,(body (cdar ls))
                   ,(clause (cdr ls))))))
             `(let ((,(rename 'tmp) ,(cadr expr)))
@@ -530,19 +552,15 @@
         (lambda (expr rename compare)
           (apply error (cdr expr)))))
 
-    ;; TODO: The whitespace characters are space, tab, line feed, form feed (not in parser yet), and carriage return.
     (define call-with-current-continuation call/cc)
-    ;; TODO: this is from r7rs, but is not really good enough by itself
-    ;(define (values . things)
-    ;  (call/cc
-    ;    (lambda (cont) (apply cont things))))
+
+    ;; Extended from r7rs definition to work in our Scheme
     (define values 
       (lambda args
         (if (and (not (null? args)) (null? (cdr args)))
             (car args)
             (cons (cons 'multiple 'values) args)))) 
-    ;; TODO: just need something good enough for bootstrapping (for now)
-    ;; does not have to be perfect (this is not, does not handle call/cc or exceptions)
+
     (define call-with-values
       (lambda (producer consumer)
         (let ((x (producer)))
@@ -629,6 +647,27 @@
       (if (null? lst)
         end
         (func (car lst) (foldr func end (cdr lst)))))
+    (define-c _read-u8
+      "(void *data, int argc, closure _, object k, object port)"
+      " Cyc_io_read_u8(data, k, port);")
+    (define-c _peek-u8
+      "(void *data, int argc, closure _, object k, object port)"
+      " Cyc_io_peek_u8(data, k, port);")
+    (define-c _write-u8
+      "(void *data, int argc, closure _, object k, object chr, object port)"
+      " return_closcall1(data, k, Cyc_write_u8(data, chr, port));")
+    (define (read-u8 . port)
+      (if (null? port)
+        (_read-u8 (current-input-port))
+        (_read-u8 (car port))))
+    (define (peek-u8 . port)
+      (if (null? port)
+        (_peek-u8 (current-input-port))
+        (_peek-u8 (car port))))
+    (define (write-u8 chr . port)
+      (if (null? port)
+        (_write-u8 chr (current-output-port))
+        (_write-u8 chr (car port))))
     (define (peek-char . port)
       (if (null? port)
         (Cyc-peek-char (current-input-port))
@@ -677,16 +716,11 @@
     (define (newline . port) 
       (apply write-char (cons #\newline port)))
     (define (not x) (if x #f #t))
-    (define (list? o)
-      (define (_list? obj)
-        (cond
-          ((null? obj) #t)
-          ((pair? obj)
-           (_list? (cdr obj)))
-          (else #f)))
-      (if (Cyc-has-cycle? o)
-        #t
-        (_list? o)))
+    (define-c list?
+      "(void *data, int argc, closure _, object k, object o)"
+      " return_closcall1(data, k, Cyc_is_list(o));"
+      "(void *data, object ptr, object o)"
+      " return Cyc_is_list(o);")
     (define (zero? n) (= n 0))
     (define (positive? n) (> n 0))
     (define (negative? n) (< n 0))
@@ -765,6 +799,17 @@
                   '())))
           ;; Fast path.
          (foldr (lambda (x y) (cons (f x) y)) '() lis1)))
+
+    ;; Experimenting with faster versions of map, for-each
+    (define (Cyc-map-loop-1 f lst)
+      (if (null? lst)
+        '()
+       (cons (f (car lst)) (Cyc-map-loop-1 f (cdr lst)))))
+    (define (Cyc-for-each-loop-1 f lst)
+      (if (null? lst)
+        '()
+       (begin (f (car lst)) 
+              (Cyc-for-each-loop-1 f (cdr lst)))))
 
     (define (for-each f lis1 . lists)
       (if (not (null? lis1))
@@ -950,9 +995,22 @@
     (define-c Cyc-make-string
       "(void *data, int argc, closure _, object k, object count, object fill)"
       " object s = NULL;
-        Cyc_check_int(data, count);
-        char c = obj_obj2char(fill);
-        int len = obj_obj2int(count);
+        char ch_buf[5];
+        char_type c;
+        int buflen, num_cp, len;
+        Cyc_check_fixnum(data, count);
+        if (!obj_is_char(fill)) {
+          Cyc_rt_raise2(data, \"Expected character buf received\", fill);
+        }
+        c = obj_obj2char(fill);
+        if (!c) {
+          buflen = 1;
+        } else {
+          Cyc_utf8_encode_char(ch_buf, 5, c);
+          buflen = strlen(ch_buf);
+        }
+        num_cp = obj_obj2int(count);
+        len = num_cp * buflen;
         if (len >= MAX_STACK_OBJ) {
           int heap_grown;
           s = gc_alloc(((gc_thread_data *)data)->heap, 
@@ -964,6 +1022,7 @@
           ((string_type *) s)->hdr.grayed = 0;
           ((string_type *) s)->tag = string_tag; 
           ((string_type *) s)->len = len;
+          ((string_type *) s)->num_cp = num_cp;
           ((string_type *) s)->str = (((char *)s) + sizeof(string_type));
         } else {
           s = alloca(sizeof(string_type));
@@ -971,9 +1030,18 @@
           ((string_type *)s)->hdr.grayed = 0;
           ((string_type *)s)->tag = string_tag; 
           ((string_type *)s)->len = len;
+          ((string_type *)s)->num_cp = num_cp;
           ((string_type *)s)->str = alloca(sizeof(char) * (len + 1));
         }
-        memset(((string_type *)s)->str, c, len);
+        if (num_cp == 1) { /* Fast path */
+          memset(((string_type *)s)->str, ch_buf[0], len);
+        } else {
+          char *buf = ((string_type *)s)->str;
+          int bi, si, slen = buflen;
+          for (bi = 0, si = 0; bi < len; bi++, si++) {
+            buf[bi] = ch_buf[si % slen];
+          }
+        }
         ((string_type *)s)->str[len] = '\\0';
         return_closcall1(data, k, s);
       ")
@@ -1152,14 +1220,14 @@
   (define exact truncate)
   (define-c inexact
     "(void *data, int argc, closure _, object k, object z)"
-    " return_inexact_double_op(data, k, (double), z); "
+    " return_inexact_double_or_cplx_op(data, k, (double), (double complex), z); "
     "(void *data, object ptr, object z)"
-    " return_inexact_double_op_no_cps(data, ptr, (double), z);")
+    " return_inexact_double_or_cplx_op_no_cps(data, ptr, (double), (double complex), z);")
   (define-c abs
     "(void *data, int argc, closure _, object k, object num)"
     " Cyc_check_num(data, num);
       if (obj_is_int(num)) {
-        return_closcall1(data, k, obj_int2obj( abs( obj_obj2int(num))));
+        return_closcall1(data, k, obj_int2obj( labs( obj_obj2int(num))));
       } else if (is_object_type(num) && type_of(num) == bignum_tag){
         alloc_bignum(data, bn);
         mp_abs(&bignum_value(num), &bignum_value(bn));
@@ -1206,8 +1274,19 @@
     " return_inexact_double_op(data, k, sqrt, z);"
     "(void *data, object ptr, object z)"
     " return_inexact_double_op_no_cps(data, ptr, sqrt, z);")
-  (define (exact-integer? num)
-    (and (exact? num) (integer? num)))
+  (define-c exact-integer?
+    "(void *data, int argc, closure _, object k, object num)"
+    " if (obj_is_int(num) || (num != NULL && !is_value_type(num) && 
+                               (type_of(num) == integer_tag || 
+                                type_of(num) == bignum_tag)))
+        return_closcall1(data, k, boolean_t);
+      return_closcall1(data, k, boolean_f); "
+    "(void *data, object ptr, object num)"
+    " if (obj_is_int(num) || (num != NULL && !is_value_type(num) && 
+                               (type_of(num) == integer_tag || 
+                                type_of(num) == bignum_tag)))
+        return boolean_t;
+      return boolean_f;")
   (define-c exact?
     "(void *data, int argc, closure _, object k, object num)"
     " Cyc_check_num(data, num);
@@ -1222,7 +1301,11 @@
         return boolean_t;
       return boolean_f;")
   (define (inexact? num) (not (exact? num)))
-  (define complex? number?) 
+  (define-c complex?
+    "(void *data, int argc, closure _, object k, object z)"
+    " return_closcall1(data, k, Cyc_is_complex(z)); "
+    "(void *data, object ptr, object z)"
+    " return Cyc_is_complex(z); ")
   (define rational? number?)
   (define (max first . rest) (foldl (lambda (old new) (if (> old new) old new)) first rest))
   (define (min first . rest) (foldl (lambda (old new) (if (< old new) old new)) first rest))
@@ -1290,7 +1373,9 @@
   (define-c input-port?
     "(void *data, int argc, closure _, object k, object port)"
     " port_type *p = (port_type *)port;
-      Cyc_check_port(data, port);
+      if (boolean_f == Cyc_is_port(port)) {
+        return_closcall1(data, k, boolean_f);
+      }
       return_closcall1(
         data, 
         k, 
@@ -1298,7 +1383,9 @@
   (define-c output-port?
     "(void *data, int argc, closure _, object k, object port)"
     " port_type *p = (port_type *)port;
-      Cyc_check_port(data, port);
+      if (boolean_f == Cyc_is_port(port)) {
+        return_closcall1(data, k, boolean_f);
+      }
       return_closcall1(
         data, 
         k, 
@@ -1306,7 +1393,9 @@
   (define-c input-port-open?
     "(void *data, int argc, closure _, object k, object port)"
     " port_type *p = (port_type *)port;
-      Cyc_check_port(data, port);
+      if (boolean_f == Cyc_is_port(port)) {
+        return_closcall1(data, k, boolean_f);
+      }
       return_closcall1(
         data, 
         k, 
@@ -1314,7 +1403,9 @@
   (define-c output-port-open?
     "(void *data, int argc, closure _, object k, object port)"
     " port_type *p = (port_type *)port;
-      Cyc_check_port(data, port);
+      if (boolean_f == Cyc_is_port(port)) {
+        return_closcall1(data, k, boolean_f);
+      }
       return_closcall1(
         data, 
         k, 
@@ -1736,32 +1827,44 @@
 ;; Record-type definitions
 (define record-marker (list 'record-marker))
 (define (register-simple-type name parent field-tags)
-  (let ((new (make-vector 3 #f)))
-    (vector-set! new 0 record-marker)
-    (vector-set! new 1 name)
-    (vector-set! new 2 field-tags)
-    new))
+  (vector record-marker name field-tags)
+  ;(let ((new (make-vector 3 #f)))
+  ;  (vector-set! new 0 record-marker)
+  ;  (vector-set! new 1 name)
+  ;  (vector-set! new 2 field-tags)
+  ;  new)
+)
 (define (make-type-predicate pred name)
   (lambda (obj)
     (and (vector? obj)
          (equal? (vector-ref obj 0) record-marker)
          (equal? (vector-ref obj 1) name))))
 (define (make-constructor make name)
-  (lambda ()
+  (lambda args
     (let* ((field-tags (vector-ref name 2))
            (field-values (make-vector (length field-tags) #f))
-           (new (make-vector 3 #f))
           )
-      (vector-set! new 0 record-marker)
-      (vector-set! new 1 name)
-      (vector-set! new 2 field-values)
-      new)))
+      (vector record-marker name field-values))))
+(define (make-constructor/args make name)
+  (lambda args
+    (let* ((field-tags (vector-ref name 2))
+           (field-values (list->vector args)))
+      (when (not (equal? (length field-tags) (length args)))
+        (error "invalid number of arguments passed to record type constructor" args))
+      (vector record-marker name field-values))))
 (define (type-slot-offset name sym)
   (let ((field-tags (vector-ref name 2)))
     (_list-index sym field-tags)))
 (define (slot-set! name obj idx val)
   (let ((vec obj)) ;; TODO: get actual slots from obj
     (vector-set! (vector-ref vec 2) idx val)))
+(define (slot-ref name obj field)
+  (let* ((idx (cond 
+                ((symbol? field)
+                 (type-slot-offset name field))
+                (else
+                  field)))) ;; Assumes field is a number
+  (vector-ref (vector-ref obj 2) idx)))
 (define (make-getter sym name idx)
   (lambda (obj)
     (vector-ref (vector-ref obj 2) idx)))
@@ -1769,21 +1872,22 @@
   (lambda (obj val)
     (vector-set! (vector-ref obj 2) idx val)))
 
-;; Find index of element in list, or -1 if not found
+;; Find index of element in list, or #f if not found
 (define _list-index
-  (lambda (e lst)
-    (if (null? lst)
-      -1
-      (if (eq? (car lst) e)
-        0
-        (if (= (_list-index e (cdr lst)) -1) 
-          -1
-          (+ 1 (_list-index e (cdr lst))))))))
+  (lambda (e lst1)
+    (let lp ((lis lst1) (n 0))
+      (and (not (null? lis))
+           (if (eq? e (car lis)) n (lp (cdr lis) (+ n 1)))))))
 
 (define (record? obj)
   (and (vector? obj)
        (> (vector-length obj) 0)
        (equal? record-marker (vector-ref obj 0))))
+
+(define (is-a? obj rtype)
+  (and (record? obj)
+       (record? rtype)
+       (equal? (vector-ref obj 1) rtype)))
 
 (define-syntax define-record-type
   (er-macro-transformer
@@ -1809,7 +1913,7 @@
        `(,(rename 'begin)
          ;; type
          (,_define ,name (,_register 
-                          ,name ;,name-str 
+                          ,name-str 
                           ,parent 
                           ',(map car fields)))
          ;; predicate
@@ -1841,27 +1945,18 @@
                 fields)
          ;; constructor
          (,_define ,make
-           ,(let lp ((ls make-fields) (sets '()))
-              (cond
-               ((null? ls)
-                `(,_let ((%make (,(rename 'make-constructor)
-                                 ,(symbol->string make) ;(identifier->symbol make))
-                                 ,name)))
-                   (,_lambda ,make-fields
-                     (,_let ((res (%make)))
-                       ,@sets
-                       res))))
-               (else
-                (let ((field (assq (car ls) fields)))
-                  (cond
-                   ((not field)
-                    (error "unknown record field in constructor" (car ls)))
-                   ((pair? (cddr field))
-                    (lp (cdr ls)
-                        (cons `(,(car (cddr field)) res ,(car ls)) sets)))
-                   (else
-                    (lp (cdr ls)
-                        (cons `(,_slot-set! ,name res (,_type_slot_offset ,name ',(car ls)) ,(car ls))
-                              sets)))))))))
+            (,_let ((%make (,(rename 'make-constructor/args)
+                            ,(symbol->string make) ;(identifier->symbol make))
+                            ,name)))
+              (,_lambda ,make-fields
+                (%make ,@make-fields))))
+         ; Possible alternate version that inlines make-constructor/args
+         ;(,_define ,make
+         ;   (,_lambda ,make-fields
+         ;     (,(rename 'vector)
+         ;     ',record-marker
+         ;      ,name
+         ;      (,(rename 'vector)
+         ;       ,@make-fields))))
   )))))
 ))

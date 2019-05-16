@@ -24,6 +24,8 @@ SLDFILES = $(wildcard $(SCHEME_DIR)/*.sld) \
 COBJECTS = $(SLDFILES:.sld=.o)
 HEADERS = $(HEADER_DIR)/runtime.h $(HEADER_DIR)/types.h
 TEST_SRC = $(TEST_DIR)/unit-tests.scm \
+					 $(TEST_DIR)/macro-hygiene.scm \
+					 $(TEST_DIR)/match-tests.scm \
 					 $(TEST_DIR)/srfi-28-tests.scm \
 					 $(TEST_DIR)/srfi-60-tests.scm \
 					 $(TEST_DIR)/srfi-121-tests.scm \
@@ -49,6 +51,8 @@ clean :
 	rm -f tests/srfi-121-tests
 	rm -f tests/srfi-143-tests
 	rm -f tests/array-list-tests
+	rm -f tests/macro-hygiene
+	rm -f tests/match-tests
 
 install : libs install-libs install-includes install-bin
 	$(MKDIR) $(DESTDIR)$(DATADIR)
@@ -63,6 +67,7 @@ install : libs install-libs install-includes install-bin
 	$(INSTALL) -m0644 scheme/cyclone/*.sld $(DESTDIR)$(DATADIR)/scheme/cyclone
 	$(INSTALL) -m0644 scheme/cyclone/*.scm $(DESTDIR)$(DATADIR)/scheme/cyclone
 	$(INSTALL) -m0644 scheme/cyclone/test.meta $(DESTDIR)$(DATADIR)/scheme/cyclone
+	$(INSTALL) -m0644 scheme/cyclone/match.meta $(DESTDIR)$(DATADIR)/scheme/cyclone
 	$(INSTALL) -m0644 scheme/cyclone/*.o $(DESTDIR)$(DATADIR)/scheme/cyclone
 	$(INSTALL) -m0755 scheme/cyclone/*.so $(DESTDIR)$(DATADIR)/scheme/cyclone
 	$(INSTALL) -m0644 srfi/*.sld $(DESTDIR)$(DATADIR)/srfi
@@ -117,7 +122,7 @@ doc :
 
 # Helper rules (of interest to people hacking on this makefile)
 
-.PHONY: clean bootstrap tags indent debug test doc
+.PHONY: clean full bench bootstrap tags indent debug test doc
 
 $(TESTS) : %: %.scm
 	$(CYCLONE) -I . $<
@@ -150,6 +155,9 @@ dispatch.c : generate-c.scm
 
 libcyclone.a : $(CFILES) $(HEADERS)
 
+hashset.o : hashset.c $(HEADERS)
+	$(CCOMP) -c $< -o $@
+
 dispatch.o : dispatch.c $(HEADERS)
 	$(CCOMP) -c $< -o $@
 
@@ -166,6 +174,7 @@ runtime.o : runtime.c $(HEADERS)
 	$(CCOMP) -c \
 					-DCYC_INSTALL_DIR=\"$(PREFIX)\" \
 					-DCYC_INSTALL_LIB=\"$(LIBDIR)\" \
+					-DCYC_INSTALL_BIN=\"$(BINDIR)\" \
 					-DCYC_INSTALL_INC=\"$(INCDIR)\" \
 					-DCYC_INSTALL_SLD=\"$(DATADIR)\" \
 					-DCYC_CC_PROG=\"$(CC_PROG)\" \
@@ -174,13 +183,20 @@ runtime.o : runtime.c $(HEADERS)
 					-DCYC_CC_SO=\"$(CC_SO)\" \
 					$< -o $@
 
-libcyclone.a : runtime.o gc.o dispatch.o mstreams.o 
-	$(AR) rcs $@ $^ 
+libcyclone.a : runtime.o gc.o dispatch.o mstreams.o hashset.o
+	$(CREATE_LIBRARY_COMMAND) $(CREATE_LIBRARY_FLAGS) $@ $&
+	$(RANLIB_COMMAND)
 # Instructions from: http://www.adp-gmbh.ch/cpp/gcc/create_lib.html
 # Note compiler will have to link to this, eg:
 #Linking against static library
 #gcc -static main.c -L. -lmean -o statically_linked
 #Note: the first three letters (the lib) must not be specified, as well as the suffix (.a)
+
+full : 
+	make clean ; make && make test && make bootstrap && cd ../cyclone-bootstrap && make clean && ./install.sh
+
+bench :
+	cd ../r7rs-benchmarks && rm results.Cyclone && ./bench cyclone all && grep Elapsed results.Cyclone >out.txt ; grep Elapsed results.Cyclone |wc ; grep -i -e error -e limit -e crash results.Cyclone ; true
 
 bootstrap : icyc libs
 	mkdir -p $(BOOTSTRAP_DIR)/scheme/cyclone
@@ -190,12 +206,14 @@ bootstrap : icyc libs
 	cp $(HEADER_DIR)/runtime-main.h $(BOOTSTRAP_DIR)/include/cyclone
 	cp $(HEADER_DIR)/runtime.h $(BOOTSTRAP_DIR)/include/cyclone
 	cp $(HEADER_DIR)/ck_ht_hash.h $(BOOTSTRAP_DIR)/include/cyclone
+	cp $(HEADER_DIR)/hashset.h $(BOOTSTRAP_DIR)/include/cyclone
 	cp scheme/*.sld $(BOOTSTRAP_DIR)/scheme
 	cp scheme/cyclone/*.sld $(BOOTSTRAP_DIR)/scheme/cyclone
 	cp srfi/*.sld $(BOOTSTRAP_DIR)/srfi
 	cp srfi/*.scm $(BOOTSTRAP_DIR)/srfi
 	cp runtime.c $(BOOTSTRAP_DIR)
 	cp mstreams.c $(BOOTSTRAP_DIR)
+	cp hashset.c $(BOOTSTRAP_DIR)
 	cp gc.c $(BOOTSTRAP_DIR)
 	cp dispatch.c $(BOOTSTRAP_DIR)
 	cp scheme/base.c $(BOOTSTRAP_DIR)/scheme
@@ -206,6 +224,7 @@ bootstrap : icyc libs
 	cp scheme/char.c $(BOOTSTRAP_DIR)/scheme
 	cp scheme/complex.c $(BOOTSTRAP_DIR)/scheme
 	cp scheme/eval.c $(BOOTSTRAP_DIR)/scheme
+	cp scheme/repl.c $(BOOTSTRAP_DIR)/scheme
 	cp scheme/file.c $(BOOTSTRAP_DIR)/scheme
 	cp scheme/inexact.c $(BOOTSTRAP_DIR)/scheme
 	cp scheme/lazy.c $(BOOTSTRAP_DIR)/scheme
@@ -218,8 +237,14 @@ bootstrap : icyc libs
 	cp tests/unit-tests.scm $(BOOTSTRAP_DIR)
 	cp scheme/cyclone/ast.c $(BOOTSTRAP_DIR)/scheme/cyclone
 	cp scheme/cyclone/cps-optimizations.c $(BOOTSTRAP_DIR)/scheme/cyclone
+	cp scheme/cyclone/cps-opt-local-var-redux.scm $(BOOTSTRAP_DIR)/scheme/cyclone
+	cp scheme/cyclone/cps-opt-analyze-call-graph.scm $(BOOTSTRAP_DIR)/scheme/cyclone
+	cp scheme/cyclone/cps-opt-memoize-pure-fncs.scm $(BOOTSTRAP_DIR)/scheme/cyclone
+	cp scheme/cyclone/hashset.c $(BOOTSTRAP_DIR)/scheme/cyclone
 	cp scheme/cyclone/libraries.c $(BOOTSTRAP_DIR)/scheme/cyclone
 	cp scheme/cyclone/macros.c $(BOOTSTRAP_DIR)/scheme/cyclone
+	cp scheme/cyclone/match.c $(BOOTSTRAP_DIR)/scheme/cyclone
+	cp scheme/cyclone/match.meta $(BOOTSTRAP_DIR)/scheme/cyclone
 	cp scheme/cyclone/pretty-print.c $(BOOTSTRAP_DIR)/scheme/cyclone
 	cp scheme/cyclone/primitives.c $(BOOTSTRAP_DIR)/scheme/cyclone
 	cp scheme/cyclone/transforms.c $(BOOTSTRAP_DIR)/scheme/cyclone
@@ -250,10 +275,11 @@ bootstrap : icyc libs
 	cp srfi/128.c $(BOOTSTRAP_DIR)/srfi
 	cp srfi/128.meta $(BOOTSTRAP_DIR)/srfi
 	cp srfi/132.c $(BOOTSTRAP_DIR)/srfi
+	cp srfi/133.c $(BOOTSTRAP_DIR)/srfi
+	cp srfi/143.c $(BOOTSTRAP_DIR)/srfi
 	cp srfi/list-queues/*.scm $(BOOTSTRAP_DIR)/srfi/list-queues
 	cp srfi/sets/*.scm $(BOOTSTRAP_DIR)/srfi/sets
 	cp srfi/sorting/*.scm $(BOOTSTRAP_DIR)/srfi/sorting
-	cp srfi/133.c $(BOOTSTRAP_DIR)/srfi
 	cp cyclone.c $(BOOTSTRAP_DIR)/cyclone.c
 	cp Makefile.config $(BOOTSTRAP_DIR)/Makefile.config
 
